@@ -161,9 +161,13 @@ bash test_run.sh
 Currently, you find `test/input/images/head-ct-angio/example_input_dummy_cta.mha` and `test/input/images/head-mr-angio/example_input_dummy_mra.mha` in the input folder.
 
 Please note that GC environment has a limit on
-* Main memory of at most 31 GiB DRAM ⚠️
-  * The `test_run.sh` simulates this limitation locally. So make sure you test your container with our `test_run.sh` first!
 * Container size must be under 10GB ⚠️
+* Usable main memory of at most 31 GiB DRAM ⚠️ (1 GB is reserved by GC, so 32 - 1 = 31)
+  * The `test_run.sh` simulates this limitation locally. So make sure you test your container with our `test_run.sh` first!
+  * _The default for newly created algorithms is 16GB._  **New in GC: You need to update the memory setting AFTER algorithm upload!** Here are the steps to change the memory used for your algorithm. 1) **After** you have uploaded the algorithm Docker, go to your **algorithm's page** and click **"Update Settings"**; 2) Fill in a number of **at most 32** in **"Job requires memory gb**; 3) **32 GB** correspond to the **`2xlarge`** instance type. (_You do not have to adjust the memory if you are okay with the 16GB default._)
+<img src="https://public.grand-challenge-user-content.org/i/2025/09/08/8dc690ed-5384-4733-b4f7-657b8963dde3.png" alt="step1" width="500" />
+<img src="https://public.grand-challenge-user-content.org/i/2025/09/08/586c414f-f0ac-43f6-ad19-5a2c2c4ad56b.png" alt="step2" width="500" />
+<img src="https://public.grand-challenge-user-content.org/i/2025/09/08/fd94c4b3-5114-42da-ab4f-562dd189747d.png" alt="step3" width="500" />
 
 ### Export and Deploy
 
