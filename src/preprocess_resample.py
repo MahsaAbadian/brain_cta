@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Offline resampling script that creates a training_data_resampled copy."""
+
 import argparse
 from pathlib import Path
 import shutil
@@ -42,6 +44,7 @@ def _resample_pair(
             f"Shape mismatch for {image_path.name}: image={image.shape}, label={label.shape}"
         )
 
+    # Read spacing from the image affine so preprocessing stays data-driven.
     spacing = spacing_from_affine(image_nii.affine)
     image_rs = resample_to_spacing(image, spacing, target_spacing, is_label=False)
     label_rs = resample_to_spacing(label, spacing, target_spacing, is_label=True)

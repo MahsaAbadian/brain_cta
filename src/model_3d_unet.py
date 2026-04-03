@@ -1,6 +1,8 @@
 # model_3d_unet.py
 from __future__ import annotations
 
+"""Compact 3D U-Net baseline for multiclass vessel segmentation."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -83,7 +85,7 @@ class UNet3D(nn.Module):
 
         b = self.bottleneck(self.pool4(e4))
 
-        # Decoder path
+        # Decoder path mirrors the encoder and fuses skip features at each scale.
         d4 = self.up4(b)
         d4 = self._match_size(d4, e4)
         d4 = self.dec4(torch.cat([d4, e4], dim=1))

@@ -1,11 +1,11 @@
-# Data Inspection and Data Utils Progress
+# Project Workflow and Notes
 
-This document records what has been implemented so far for data understanding and split utilities.
+This document records the current project workflow and the implementation details behind each stage.
 
-## 1) Data inspection work completed
+## 1) Data inspection and validation
 
 ### File
-- `data_inspection/inspect_data.py`
+- `src/inspect_data.py`
 
 ### What this script currently does
 - Loads one CTA image and its matching label by `case_id`.
@@ -35,7 +35,7 @@ This document records what has been implemented so far for data understanding an
   - `asp_sag = sz/sy`
   - `asp_cor = sz/sx`
   - `asp_ax = sy/sx`
-- Saves raw-data figures inside `data_inspection/`:
+- Saves raw-data figures next to the script inside `src/`:
   - `inspect_data_slices.png` (CTA grayscale slices)
   - `inspect_data_labels.png` (label slices)
   - `inspect_data_overlay.png` (labels overlaid on CTA)
@@ -50,21 +50,21 @@ This document records what has been implemented so far for data understanding an
 
 ### Current runtime command
 - From project root:
-  - `.venv/bin/python data_inspection/inspect_data.py`
+  - `.venv/bin/python src/inspect_data.py`
 
 ### Notes
 - Matplotlib backend is set to `"Agg"` (non-interactive) so this script saves images without opening windows.
 - `plt.show()` is intentionally commented out for non-GUI runs.
 - Script is path-safe from different working directories because it resolves:
   - `project_root = Path(__file__).resolve().parent.parent`
-  - output folder as script-local `data_inspection/`
+  - output folder as script-local `src/`
 
 ---
 
-## 2) Data utility work completed
+## 2) Data preprocessing and utility functions
 
 ### File
-- `data_utils.py`
+- `src/data_utils.py`
 
 ### Functions currently present
 
@@ -94,7 +94,15 @@ This document records what has been implemented so far for data understanding an
 - Normalizes to `[0, 1]` using min-max scaling.
 - Casts to `np.float32`.
 - Currently reused in:
-  - `data_inspection/inspect_data.py`
+  - `src/inspect_data.py`
+
+#### `spacing_from_affine(affine)`
+- Extracts voxel spacing directly from a NIfTI affine.
+- Used by the offline resampling pipeline.
+
+#### `resample_to_spacing(volume, current_spacing, target_spacing, is_label)`
+- Resamples a volume to the requested spacing.
+- Uses linear interpolation for images and nearest-neighbor interpolation for labels.
 
 #### Script mode (`if __name__ == "__main__":`)
 - Uses CTA folders:
@@ -119,7 +127,52 @@ This document records what has been implemented so far for data understanding an
 
 ---
 
-## 4) Patch Sampling Strategies (Training)
+## 4) Offline isotropic resampling
+
+### File
+- `src/preprocess_resample.py`
+
+### Purpose
+- Read per-case spacing from NIfTI affine.
+- Resample image/label once to a fixed target spacing.
+- Save resampled pairs to a new dataset root (no repeated on-the-fly resampling each epoch).
+
+### Default command (all matched datasets)
+- `.venv/bin/python src/preprocess_resample.py`
+
+### Optional custom spacing
+- `.venv/bin/python src/preprocess_resample.py --sx 0.6 --sy 0.6 --sz 0.6`
+
+### Optional: process explicit dataset suffixes only
+- `.venv/bin/python src/preprocess_resample.py --dataset topbrain_ct --dataset topbrain_mr`
+
+### Optional: copy split + label maps into resampled root
+- `.venv/bin/python src/preprocess_resample.py --copy-metadata`
+
+### Output layout (default root)
+- `training_data_resampled/imagesTr_*`
+- `training_data_resampled/labelsTr_*`
+
+### Integration note
+- Runtime resampling has been removed from `src/data_loader.py`.
+- `build_train_val_loaders(...)` defaults now read images/labels from:
+  - `training_data_resampled/imagesTr_topbrain_ct`
+  - `training_data_resampled/labelsTr_topbrain_ct`
+---
+
+## 5) Current coded workflow order
+
+The current code follows this order:
+1. `src/inspect_data.py`: inspect raw images, labels, spacing, and overlays.
+2. `src/preprocess_resample.py`: resample raw NIfTI volumes once into `training_data_resampled/`.
+3. `src/data_utils.py`: provide shared preprocessing, spacing, cropping, and split helpers.
+4. `src/data_loader.py`: build datasets/loaders from the resampled training folders.
+5. `src/model_3d_unet.py`: define the baseline 3D U-Net.
+6. `src/train.py`: run the current short training sanity check.
+
+---
+
+## 6) Patch Sampling Strategies (Training)
 
 When loading 3D crops (patches) for training, we have a few options to ensure the model sees useful, non-redundant data.
 
@@ -161,7 +214,7 @@ Modify the dataloader so that for a training crop, we first randomly decide if t
 
 ---
 
-## 5) Patch Size Selection
+## 7) Patch Size Selection
 
 When extracting 3D sub-volumes for training, we use a fixed patch size. Our baseline choices are typically `(96, 96, 96)` or `(128, 128, 128)`.
 
@@ -176,10 +229,10 @@ When extracting 3D sub-volumes for training, we use a fixed patch size. Our base
 
 ---
 
-## 6) 3D U-Net Model Choice
+## 8) 3D U-Net Model Choice
 
 ### File
-- `model3dunet.py`
+- `src/model_3d_unet.py`
 
 ### Architecture implemented
 - Model class: `UNet3D(in_channels=1, num_classes=41, base_ch=16)`.
@@ -203,16 +256,36 @@ When extracting 3D sub-volumes for training, we use a fixed patch size. Our base
 1. **Task fit for volumetric vessels**: Vessel anatomy is 3D and topology-sensitive. A 3D U-Net captures continuity across slices better than 2D models.
 2. **Localization + context balance**: U-Net skip connections preserve fine vessel boundaries while the deep encoder learns larger anatomical context.
 3. **Stable baseline for small datasets**: For ~25 CTA training volumes, a compact `base_ch=16` U-Net is strong enough without being too large to train.
-4. **Compatible with current patch pipeline**: Works directly with patch tensors from `data_loader.py` after flattening to `(B_eff, 1, D, H, W)`.
+4. **Compatible with current patch pipeline**: Works directly with patch tensors from `src/data_loader.py` after flattening to `(B_eff, 1, D, H, W)`.
 5. **Loss compatibility**: Raw logits are correct for `CrossEntropyLoss` (and Dice+CE variants that also expect logits).
 
 ### Forward-pass sanity target
 - Given input batch `(B, 1, 96, 96, 96)`, expected output is `(B, 41, 96, 96, 96)`.
-- Current `__main__` block in `model3dunet.py` already verifies this shape behavior.
+- Current `__main__` block in `src/model_3d_unet.py` already verifies this shape behavior.
 
 ---
 
-## Alternative U-Net Architectures (and relevance to TopBrain CTA)
+## 9) Training sanity check
+
+### File
+- `src/train.py`
+
+### Purpose
+- Builds the current CTA dataloader from resampled data.
+- Instantiates the baseline `UNet3D`.
+- Runs a short optimization loop to confirm the full pipeline works end-to-end.
+
+### Current runtime command
+- From project root:
+  - `.venv/bin/python src/train.py`
+
+### Notes
+- This is intentionally a short sanity-check script, not a full experiment runner yet.
+- It is meant to catch data/model/loss wiring issues quickly before longer experiments.
+
+---
+
+## 10) Alternative U-Net Architectures (and relevance to TopBrain CTA)
 
 This section discusses common U-Net variants that could replace or extend the current `UNet3D` baseline.
 
@@ -284,35 +357,3 @@ This section discusses common U-Net variants that could replace or extend the cu
 5. Use transformer models only as advanced experiments after strong baselines.
 
 ---
-
-## 9) Offline Isotropic Resampling (Implemented)
-
-### File
-- `preprocess_resample.py`
-
-### Purpose
-- Read per-case spacing from NIfTI affine.
-- Resample image/label once to a fixed target spacing.
-- Save resampled pairs to a new dataset root (no repeated on-the-fly resampling each epoch).
-
-### Default command (all matched datasets)
-- `python preprocess_resample.py`
-
-### Optional custom spacing
-- `python preprocess_resample.py --sx 0.6 --sy 0.6 --sz 0.6`
-
-### Optional: process explicit dataset suffixes only
-- `python preprocess_resample.py --dataset topbrain_ct --dataset topbrain_mr`
-
-### Optional: copy split + label maps into resampled root
-- `python preprocess_resample.py --copy-metadata`
-
-### Output layout (default root)
-- `training_data_resampled/imagesTr_*`
-- `training_data_resampled/labelsTr_*`
-
-### Integration note
-- Runtime resampling has been removed from `data_loader.py`.
-- `build_train_val_loaders(...)` defaults now read images/labels from:
-  - `training_data_resampled/imagesTr_topbrain_ct`
-  - `training_data_resampled/labelsTr_topbrain_ct`

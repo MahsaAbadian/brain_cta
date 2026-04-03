@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Patch-based dataset and dataloader utilities for TopBrain CTA training."""
+
 import random
 from pathlib import Path
 from typing import Callable, Sequence
@@ -161,6 +163,8 @@ class CTAPatchDataset(Dataset):
                 f"Shape mismatch for {case_id}: image={image.shape}, label={label.shape}"
             )
 
+        # Intensity preprocessing is applied before cropping so every patch sees
+        # the same normalized range.
         image = self.preprocess_fn(image)
 
         for dim, p in zip(image.shape, self.patch_size):
@@ -184,6 +188,7 @@ class CTAPatchDataset(Dataset):
             image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
             label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
         else:
+            # Validation uses a deterministic center crop for repeatability.
             image, label = center_crop_3d(image, label, self.patch_size)
             image_t = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
             label_t = torch.from_numpy(label).long().unsqueeze(0)  # (1, D, H, W)

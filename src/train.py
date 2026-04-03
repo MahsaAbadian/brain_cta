@@ -1,8 +1,10 @@
+"""Minimal training script used to sanity-check the current CTA pipeline."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from data_loader import build_train_val_loaders
-from model3dunet import UNet3D
+from model_3d_unet import UNet3D
 
 
 class DiceCELoss(nn.Module):
@@ -39,6 +41,7 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
 
+    # This script intentionally uses a tiny run so data/model issues show up fast.
     _, _, train_loader, _, num_classes = build_train_val_loaders(
         patch_size=(64, 64, 64),
         num_patches_per_volume=1,

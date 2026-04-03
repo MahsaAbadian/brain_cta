@@ -1,5 +1,5 @@
 # Run from project root with the project venv:
-#   .venv/bin/python data_inspection/inspect_data.py
+#   .venv/bin/python src/inspect_data.py
 import numpy as np
 import nibabel as nib
 from pathlib import Path

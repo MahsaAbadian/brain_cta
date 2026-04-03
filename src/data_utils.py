@@ -1,4 +1,6 @@
 
+"""Utility functions for dataset splits, preprocessing, cropping, and resampling."""
+
 import random
 from pathlib import Path
 import logging
@@ -66,6 +68,7 @@ if __name__ == "__main__":
     print("First few val:", val_ids[:5])
 
 def preprocess_ct(x, low=-100.0, high=400.0):
+    """Clip CT intensities to a vessel-focused window and normalize to [0, 1]."""
     x = np.clip(x, low, high)
     x = (x - low) / (high - low)
     return x.astype(np.float32)
@@ -116,6 +119,7 @@ def center_crop_3d(
 
 
 def spacing_from_affine(affine: np.ndarray) -> np.ndarray:
+    """Extract voxel spacing in mm from a NIfTI affine."""
     return np.sqrt(np.sum(affine[:3, :3] ** 2, axis=0)).astype(np.float32)
 
 def resample_to_spacing(
@@ -124,6 +128,7 @@ def resample_to_spacing(
     target_spacing=(0.6, 0.6, 0.6),
     is_label=False,
 ) -> np.ndarray:
+    """Resample an image or label volume to a target spacing."""
     target_spacing = np.array(target_spacing, dtype=np.float32)
     zoom_factors = current_spacing / target_spacing
     order = 0 if is_label else 1  # nearest for labels, linear for images
