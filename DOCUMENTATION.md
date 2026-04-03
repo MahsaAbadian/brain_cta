@@ -212,18 +212,7 @@ When extracting 3D sub-volumes for training, we use a fixed patch size. Our base
 
 ---
 
-## 7) Next intended usage
-
-- Keep `data_inspection/inspect_data.py` for visual QA and sanity checks.
-- Reuse `preprocess_ct(...)` in both:
-  - training data pipeline
-  - inference path in `your_algorithm.py`
-- Use saved split files in `training_data/split/` as the source of train/val case IDs.
-- Keep comparing raw vs preprocessed overlays to validate that vessel visibility is preserved before training.
-
----
-
-## 8) Alternative U-Net Architectures (and relevance to TopBrain CTA)
+## Alternative U-Net Architectures (and relevance to TopBrain CTA)
 
 This section discusses common U-Net variants that could replace or extend the current `UNet3D` baseline.
 
