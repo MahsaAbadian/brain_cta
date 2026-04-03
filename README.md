@@ -16,7 +16,8 @@ Create and activate a virtual environment, then install dependencies:
 
 ## Get the Data
 
-Use the TopBrain 2025 data release. The included `training_data/README.txt` describes the dataset structure and license.
+Use the TopBrain 2025 data release: https://zenodo.org/records/16878417
+The included `training_data/README.txt` describes the dataset structure and license.
 
 Main reference:
 - `https://topbrain2025.grand-challenge.org`

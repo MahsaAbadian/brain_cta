@@ -1,0 +1,17 @@
+Specification of the terms of data use of the TopBrain 2025 challenge released data:
+
+* Following the definitions of "https://opendata.swiss/en/terms-of-use" (retrieved in July 2025) on open data use, the following license is chosen:
+
+"Terms of data use:
+
+    Open use. Must provide the source. Use for commercial purposes requires permission of the data owner.
+
+        * You may use this dataset for non-commercial purposes.
+
+        * You may use this dataset for commercial purposes, but you must seek prior permission from the data owner.
+
+        * You must provide the source (author, title and link to the dataset)."
+
+
+Data owner is University Hospital of Zurich, Department of Neurology, Rämistrasse 100, 8091 Zürich (USZ),
+the resulting publications or pre-prints of the TopBrain and the TopCoW challenge – to which USZ is a co-author – will serve as reference for data citation.

@@ -165,7 +165,9 @@ cython_debug/
 .envrc
 
 # Project data and generated outputs
-training_data/
+training_data/*
+!training_data/README.txt
+!training_data/License.txt
 training_data_resampled/
 data_inspection/*.png
 
