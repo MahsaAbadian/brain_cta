@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Patch-based dataset and dataloader utilities for TopBrain CTA training."""
+"""Patch-based dataset and dataloader utilities for training on preprocessed data."""
 
 import random
 from pathlib import Path
@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader, Dataset
 from data_utils import (
     extract_case_ids,
     load_split_ids,
-    preprocess_ct,
     split_and_save,
     random_crop_3d, 
     center_crop_3d,
@@ -127,7 +126,7 @@ class CTAPatchDataset(Dataset):
         label_dir: Path,
         patch_size: tuple[int, int, int] = (96, 96, 96),
         mode: str = "train",
-        preprocess_fn: Callable[[np.ndarray], np.ndarray] = preprocess_ct,
+        preprocess_fn: Callable[[np.ndarray], np.ndarray] | None = None,
         do_augment: bool = True,
         num_classes: int = 41,
         num_patches: int = 4,
@@ -163,9 +162,10 @@ class CTAPatchDataset(Dataset):
                 f"Shape mismatch for {case_id}: image={image.shape}, label={label.shape}"
             )
 
-        # Intensity preprocessing is applied before cropping so every patch sees
-        # the same normalized range.
-        image = self.preprocess_fn(image)
+        # CT normalization is now expected to happen offline in
+        # src/preprocess_resample.py, so this hook is optional.
+        if self.preprocess_fn is not None:
+            image = self.preprocess_fn(image)
 
         for dim, p in zip(image.shape, self.patch_size):
             if p > dim:
@@ -204,10 +204,10 @@ class CTAPatchDataset(Dataset):
 
 def build_train_val_loaders(
     *,
-    split_dir: Path = Path("training_data/split"),
+    split_dir: Path = Path("training_data_resampled/split"),
     image_dir: Path = Path("training_data_resampled/imagesTr_topbrain_ct"),
     label_dir: Path = Path("training_data_resampled/labelsTr_topbrain_ct"),
-    labelmap_path: Path = Path("training_data/itksnap_labelmap_txt/labelmap_topbrain_ct.txt"),
+    labelmap_path: Path = Path("training_data_resampled/itksnap_labelmap_txt/labelmap_topbrain_ct.txt"),
     split_ratio: float = 0.8,
     patch_size: tuple[int, int, int] = (96, 96, 96),
     num_patches_per_volume: int = 4,
@@ -256,7 +256,7 @@ def build_train_val_loaders(
         label_dir=label_dir,
         patch_size=patch_size,
         mode="train",
-        preprocess_fn=preprocess_ct,
+        preprocess_fn=None,
         do_augment=True,
         num_classes=num_classes,
         num_patches=num_patches_per_volume,
@@ -267,7 +267,7 @@ def build_train_val_loaders(
         label_dir=label_dir,
         patch_size=patch_size,
         mode="val",
-        preprocess_fn=preprocess_ct,
+        preprocess_fn=None,
         do_augment=False,
         num_classes=num_classes,
         num_patches=1,

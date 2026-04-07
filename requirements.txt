@@ -1,3 +1,4 @@
 SimpleITK
 numpy
 scipy
+pytest

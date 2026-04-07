@@ -9,6 +9,7 @@ The current goal is to build and compare a 3D U-Net baseline for TopBrain vessel
 ## Repository Overview
 
 - `README.md`: quick start for collaborators using this repo.
+- `TRAINING.md`: detailed training documentation (loss, parameters, metrics, checkpoints).
 - `DOCUMENTATION.md`: detailed project notes, design decisions, and implementation progress.
 - `Competision_README.md`: archived challenge/submission instructions from the original template.
 - `requirements.txt`: Python dependencies for the project environment.
@@ -16,7 +17,8 @@ The current goal is to build and compare a 3D U-Net baseline for TopBrain vessel
 - `src/data_loader.py`: dataset and dataloader code used for loading patches for training/validation.
 - `src/data_utils.py`: helper functions for preprocessing, split handling, cropping, spacing, and label utilities.
 - `src/model_3d_unet.py`: 3D U-Net model definition.
-- `src/train.py`: baseline training/sanity-check script for the current pipeline.
+- `src/train.py`: full baseline training script (epochs, validation, checkpoints, metrics).
+- `src/train_sanity_check.py`: tiny pipeline sanity-check run for quick debugging.
 - `src/inspect_data.py`: script for visualizing scans, labels, overlays, and spacing information.
 - `training_data/README.txt`: dataset description from the TopBrain release.
 - `training_data/License.txt`: dataset license information from the TopBrain release.
@@ -71,7 +73,36 @@ The current loader defaults point to the resampled CTA folders, so after preproc
 .venv/bin/python src/train.py
 ```
 
-At the moment, `train.py` is a short sanity-check training run that verifies the pipeline, loss, and model wiring. It is useful as a baseline check before adding longer experiment scripts.
+`train.py` now runs a full baseline loop with validation, checkpoint saving, and metric logging.
+Detailed training behavior and argument reference: `TRAINING.md`.
+
+For a quick pipeline smoke check, run:
+
+```bash
+.venv/bin/python src/train_sanity_check.py
+```
+
+## Run Tests
+
+The project uses `pytest` with tests under `tests/`.
+
+Run all tests:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Run only fast tests (skip slow full-dataset checks):
+
+```bash
+.venv/bin/python -m pytest -q -m "not slow"
+```
+
+Run only slow/integration tests:
+
+```bash
+.venv/bin/python -m pytest -q -m "slow or integration"
+```
 
 ## Collaboration Notes
 

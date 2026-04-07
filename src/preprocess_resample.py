@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Offline resampling script that creates a training_data_resampled copy."""
+"""Offline preprocessing script that resamples data and normalizes CT volumes."""
 
 import argparse
 from pathlib import Path
@@ -9,7 +9,7 @@ import shutil
 import nibabel as nib
 import numpy as np
 
-from data_utils import resample_to_spacing, spacing_from_affine
+from data_utils import preprocess_ct, resample_to_spacing, spacing_from_affine
 
 
 def _make_target_affine(old_affine: np.ndarray, target_spacing: tuple[float, float, float]) -> np.ndarray:
@@ -32,6 +32,7 @@ def _resample_pair(
     out_image_path: Path,
     out_label_path: Path,
     target_spacing: tuple[float, float, float],
+    normalize_ct: bool,
 ) -> None:
     image_nii = nib.load(str(image_path))
     label_nii = nib.load(str(label_path))
@@ -48,6 +49,8 @@ def _resample_pair(
     spacing = spacing_from_affine(image_nii.affine)
     image_rs = resample_to_spacing(image, spacing, target_spacing, is_label=False)
     label_rs = resample_to_spacing(label, spacing, target_spacing, is_label=True)
+    if normalize_ct:
+        image_rs = preprocess_ct(image_rs)
     label_rs = np.rint(label_rs).astype(np.int16)
 
     out_affine = _make_target_affine(image_nii.affine, target_spacing)
@@ -86,6 +89,7 @@ def _resample_dataset_dirs(
         raise FileNotFoundError(f"No image files found in {image_dir}")
 
     n_done = 0
+    normalize_ct = image_dir.name.endswith("_ct")
     print(f"\n[dataset] {image_dir.name} + {label_dir.name}")
     for image_path in image_files:
         case_id = image_path.name.replace("_0000.nii.gz", "")
@@ -102,6 +106,7 @@ def _resample_dataset_dirs(
             out_image_path=out_image_path,
             out_label_path=out_label_path,
             target_spacing=target_spacing,
+            normalize_ct=normalize_ct,
         )
         n_done += 1
 

@@ -1,14 +1,31 @@
-"""Minimal training script used to sanity-check the current CTA pipeline."""
+"""Full baseline training script with validation, checkpoints, and metric logging."""
 
+from __future__ import annotations
+
+import argparse
+import csv
+import random
+import time
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from data_loader import build_train_val_loaders
 from model_3d_unet import UNet3D
 
 
 class DiceCELoss(nn.Module):
-    def __init__(self, num_classes: int, dice_weight: float = 1.0, ce_weight: float = 1.0, include_background: bool = True, eps: float = 1e-6):
+    def __init__(
+        self,
+        num_classes: int,
+        dice_weight: float = 1.0,
+        ce_weight: float = 1.0,
+        include_background: bool = True,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.dice_weight = dice_weight
@@ -37,64 +54,288 @@ class DiceCELoss(nn.Module):
         return self.ce_weight * ce_loss + self.dice_weight * dice_loss
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train baseline 3D U-Net on resampled CTA data.")
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--patch-size", type=int, nargs=3, default=(96, 96, 96))
+    parser.add_argument("--num-patches-per-volume", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--base-ch", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))
+    return parser.parse_args()
+
+
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _flatten_loader_batch(
+    batch_x: torch.Tensor, batch_y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # data_loader returns:
+    # image: (B_volume, Patches, C, D, H, W)
+    # label: (B_volume, Patches, D, H, W)
+    x = batch_x.flatten(0, 1)
+    y = batch_y.flatten(0, 1)
+    return x, y
+
+
+def _compute_per_class_dice(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    eps: float = 1e-6,
+) -> tuple[list[float], list[int]]:
+    dice_vals: list[float] = []
+    valid_counts: list[int] = []
+    for c in range(num_classes):
+        pred_c = pred == c
+        tgt_c = target == c
+        denom = pred_c.sum().item() + tgt_c.sum().item()
+        if denom == 0:
+            dice_vals.append(0.0)
+            valid_counts.append(0)
+            continue
+        inter = (pred_c & tgt_c).sum().item()
+        dice = (2.0 * inter + eps) / (denom + eps)
+        dice_vals.append(float(dice))
+        valid_counts.append(1)
+    return dice_vals, valid_counts
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
+    model.train()
+    running_loss = 0.0
+    n_steps = 0
+    for batch_x, batch_y, _ in loader:
+        batch_x, batch_y = _flatten_loader_batch(batch_x, batch_y)
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+
+        optimizer.zero_grad()
+        logits = model(batch_x)
+        loss = criterion(logits, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += float(loss.item())
+        n_steps += 1
+    return running_loss / max(n_steps, 1)
+
+
+def validate_one_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    num_classes: int,
+) -> tuple[float, float, list[float]]:
+    model.eval()
+    running_loss = 0.0
+    n_steps = 0
+
+    per_class_sum = [0.0] * num_classes
+    per_class_count = [0] * num_classes
+
+    with torch.no_grad():
+        for batch_x, batch_y, _ in loader:
+            batch_x, batch_y = _flatten_loader_batch(batch_x, batch_y)
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+
+            logits = model(batch_x)
+            loss = criterion(logits, batch_y)
+            running_loss += float(loss.item())
+            n_steps += 1
+
+            pred = torch.argmax(logits, dim=1)
+            dice_vals, valid_counts = _compute_per_class_dice(
+                pred=pred, target=batch_y, num_classes=num_classes
+            )
+            for c in range(num_classes):
+                if valid_counts[c]:
+                    per_class_sum[c] += dice_vals[c]
+                    per_class_count[c] += 1
+
+    avg_loss = running_loss / max(n_steps, 1)
+    per_class_dice = [
+        (per_class_sum[c] / per_class_count[c]) if per_class_count[c] > 0 else 0.0
+        for c in range(num_classes)
+    ]
+
+    # Mean foreground Dice (exclude background class 0).
+    fg_scores = [
+        per_class_dice[c]
+        for c in range(1, num_classes)
+        if per_class_count[c] > 0
+    ]
+    mean_fg_dice = float(sum(fg_scores) / max(len(fg_scores), 1))
+
+    return avg_loss, mean_fg_dice, per_class_dice
+
+
+def _save_checkpoint(
+    path: Path,
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    best_val_dice: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "best_val_dice": best_val_dice,
+        },
+        path,
+    )
+
+
 def main() -> int:
+    args = parse_args()
+    _set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
 
-    # This script intentionally uses a tiny run so data/model issues show up fast.
-    _, _, train_loader, _, num_classes = build_train_val_loaders(
-        patch_size=(64, 64, 64),
-        num_patches_per_volume=1,
-        batch_size=1,
-        num_workers=0,
+    out_dir: Path = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metrics_csv = out_dir / "metrics.csv"
+
+    patch_size = tuple(int(x) for x in args.patch_size)
+    _, _, train_loader, val_loader, num_classes = build_train_val_loaders(
+        patch_size=patch_size,
+        num_patches_per_volume=args.num_patches_per_volume,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    print(
+        f"num_classes={num_classes} patch_size={patch_size} "
+        f"train_batches={len(train_loader)} val_batches={len(val_loader)}"
     )
 
-    model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=16).to(device)
+    model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
     criterion = DiceCELoss(
         num_classes=num_classes,
         dice_weight=1.0,
         ce_weight=1.0,
         include_background=True,
     )
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=6, eta_min=1e-6
+        optimizer, T_max=max(args.epochs, 1), eta_min=1e-6
     )
 
-    # Use one fixed batch for a controlled "loss should decrease" sanity check.
-    batch_x, batch_y, case_ids = next(iter(train_loader))
-    print(f"case_ids={list(case_ids)}")
-    print(f"raw batch_x shape={tuple(batch_x.shape)}")
-    print(f"raw batch_y shape={tuple(batch_y.shape)}")
+    with metrics_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "epoch",
+                "lr",
+                "train_loss",
+                "val_loss",
+                "val_mean_fg_dice",
+            ]
+        )
 
-    # data_loader returns (B_volume, Patches, C, D, H, W) and (B_volume, Patches, D, H, W)
-    batch_x = batch_x.flatten(0, 1).to(device)
-    batch_y = batch_y.flatten(0, 1).to(device)
-    print(f"flattened batch_x shape={tuple(batch_x.shape)}")
-    print(f"flattened batch_y shape={tuple(batch_y.shape)}")
+    best_val_dice = -1.0
+    best_path = out_dir / "checkpoint_best.pt"
+    latest_path = out_dir / "checkpoint_latest.pt"
 
-    model.train()
-    losses: list[float] = []
-    num_steps = 3
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+        )
+        val_loss, val_mean_fg_dice, per_class_dice = validate_one_epoch(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+            num_classes=num_classes,
+        )
 
-    for step in range(num_steps):
-        optimizer.zero_grad()
-        logits = model(batch_x)
-        loss = criterion(logits, batch_y)
-        loss.backward()
-        optimizer.step()
+        lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step()
 
-        loss_value = float(loss.item())
-        losses.append(loss_value)
-        lr = optimizer.param_groups[0]["lr"]
-        print(f"step={step:02d} loss={loss_value:.6f} lr={lr:.8f}")
+        with metrics_csv.open("a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    epoch,
+                    f"{lr:.10f}",
+                    f"{train_loss:.6f}",
+                    f"{val_loss:.6f}",
+                    f"{val_mean_fg_dice:.6f}",
+                ]
+            )
 
-    print(
-        f"loss trend: first={losses[0]:.6f} last={losses[-1]:.6f} "
-        f"({'decreased' if losses[-1] < losses[0] else 'not decreased'})"
-    )
+        _save_checkpoint(
+            path=latest_path,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            best_val_dice=best_val_dice,
+        )
+        if args.save_every > 0 and (epoch % args.save_every == 0):
+            _save_checkpoint(
+                path=out_dir / f"checkpoint_epoch_{epoch:03d}.pt",
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_dice=best_val_dice,
+            )
+        if val_mean_fg_dice > best_val_dice:
+            best_val_dice = val_mean_fg_dice
+            _save_checkpoint(
+                path=best_path,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_dice=best_val_dice,
+            )
+
+        elapsed = time.time() - epoch_start
+        print(
+            f"[epoch {epoch:03d}/{args.epochs:03d}] "
+            f"lr={lr:.2e} train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f} "
+            f"time={elapsed:.1f}s"
+        )
+        if epoch == 1:
+            print(
+                "per_class_dice sample (classes 0..5): "
+                + ", ".join(f"{d:.4f}" for d in per_class_dice[:6])
+            )
+
+    print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
+    print(f"Saved metrics: {metrics_csv}")
+    print(f"Saved checkpoints: {latest_path}, {best_path}")
     return 0
 
 

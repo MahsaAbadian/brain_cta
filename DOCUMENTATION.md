@@ -2,6 +2,19 @@
 
 This document records the current project workflow and the implementation details behind each stage.
 
+## Project stage order
+
+The project is now organized in this order:
+1. Data inspection / validation
+2. One-time preprocessing: resampling + CT normalization
+3. Inspect and validate preprocessed data
+4. Data loading
+5. Model
+6. Training
+7. Evaluation
+8. Experiments and ablations
+9. Future model variants
+
 ## 1) Data inspection and validation
 
 ### File
@@ -47,10 +60,12 @@ This document records the current project workflow and the implementation detail
 - Saves preprocessed-data figures:
   - `inspect_data_preprocessed.png` (preprocessed grayscale slices)
   - `inspect_data_preprocessed_overlay.png` (preprocessed image with label overlay)
+- Can also be pointed at `training_data_resampled/` to inspect the preprocessed dataset.
 
 ### Current runtime command
 - From project root:
   - `.venv/bin/python src/inspect_data.py`
+  - `.venv/bin/python src/inspect_data.py --data-root training_data_resampled --already-preprocessed`
 
 ### Notes
 - Matplotlib backend is set to `"Agg"` (non-interactive) so this script saves images without opening windows.
@@ -61,12 +76,14 @@ This document records the current project workflow and the implementation detail
 
 ---
 
-## 2) Data preprocessing and utility functions
+## 2) Shared helpers for preprocessing and loading
 
 ### File
 - `src/data_utils.py`
 
 ### Functions currently present
+
+This file contains the shared helper functions used by the preprocessing and loading stages. The one-time preprocessing stage now consists of isotropic resampling plus CT intensity normalization.
 
 #### `extract_case_ids(image_dir, label_dir, image_suffix="_0000.nii.gz", label_suffix=".nii.gz")`
 - Intention:
@@ -95,6 +112,8 @@ This document records the current project workflow and the implementation detail
 - Casts to `np.float32`.
 - Currently reused in:
   - `src/inspect_data.py`
+  - `src/preprocess_resample.py`
+- CT normalization is now part of the one-time offline preprocessing step.
 
 #### `spacing_from_affine(affine)`
 - Extracts voxel spacing directly from a NIfTI affine.
@@ -113,7 +132,20 @@ This document records the current project workflow and the implementation detail
 
 ---
 
-## 3) Dataset conventions validated so far
+## 3) Inspect and validate preprocessed data
+
+After running `src/preprocess_resample.py`, the next step is to inspect the saved outputs in `training_data_resampled/`.
+
+### Current validation goal
+- Confirm image/label alignment is preserved after resampling.
+- Confirm CT images are already normalized and saved in the processed dataset.
+- Confirm labels still contain valid integer class ids.
+
+### Recommended runtime command
+- From project root:
+  - `.venv/bin/python src/inspect_data.py --data-root training_data_resampled --already-preprocessed`
+
+### Dataset conventions validated so far
 
 - Data is 3D.
 - For tested case `topcow_ct_005`:
@@ -127,7 +159,7 @@ This document records the current project workflow and the implementation detail
 
 ---
 
-## 4) Offline isotropic resampling
+## 4) One-time preprocessing: resampling + CT normalization
 
 ### File
 - `src/preprocess_resample.py`
@@ -135,6 +167,7 @@ This document records the current project workflow and the implementation detail
 ### Purpose
 - Read per-case spacing from NIfTI affine.
 - Resample image/label once to a fixed target spacing.
+- Apply CT intensity normalization once during preprocessing.
 - Save resampled pairs to a new dataset root (no repeated on-the-fly resampling each epoch).
 
 ### Default command (all matched datasets)
@@ -152,87 +185,44 @@ This document records the current project workflow and the implementation detail
 ### Output layout (default root)
 - `training_data_resampled/imagesTr_*`
 - `training_data_resampled/labelsTr_*`
+- `training_data_resampled/split`
+- `training_data_resampled/itksnap_labelmap_txt`
+- `training_data_resampled/README.txt`
+- `training_data_resampled/License.txt`
 
-### Integration note
-- Runtime resampling has been removed from `src/data_loader.py`.
-- `build_train_val_loaders(...)` defaults now read images/labels from:
-  - `training_data_resampled/imagesTr_topbrain_ct`
-  - `training_data_resampled/labelsTr_topbrain_ct`
----
+### What this means in practice
+- Raw source data stays in `training_data/`.
+- Training-ready data and metadata are written to `training_data_resampled/`.
+- This one-time preprocessing step now includes both resampling and CT normalization.
+- After resampling, training should use only the `training_data_resampled/` root.
 
-## 5) Current coded workflow order
-
-The current code follows this order:
-1. `src/inspect_data.py`: inspect raw images, labels, spacing, and overlays.
-2. `src/preprocess_resample.py`: resample raw NIfTI volumes once into `training_data_resampled/`.
-3. `src/data_utils.py`: provide shared preprocessing, spacing, cropping, and split helpers.
-4. `src/data_loader.py`: build datasets/loaders from the resampled training folders.
-5. `src/model_3d_unet.py`: define the baseline 3D U-Net.
-6. `src/train.py`: run the current short training sanity check.
 
 ---
 
-## 6) Patch Sampling Strategies (Training)
+## 5) Data loading
 
-When loading 3D crops (patches) for training, we have a few options to ensure the model sees useful, non-redundant data.
+### File
+- `src/data_loader.py`
 
-### Option A: Pure Random Cropping
-- **How it works**: Pick random `(x, y, z)` starting coordinates for every patch.
-- **Pros**: Very easy to implement.
-- **Cons**: Brain vessels are sparse (most of the head is brain tissue, bone, or air). Pure random crops will yield many patches with only background (label `0`), leading to slow training and class imbalance.
+### Purpose
+- Build datasets and dataloaders entirely from the preprocessed `training_data_resampled/` root.
+- Read images, labels, split files, and label maps from the same processed dataset root.
+- Sample training patches and center-crop validation patches.
+- Apply data augmentation during training only.
 
-### Option B: Foreground-Aware Cropping (Balanced Random)
-- **How it works**: Pre-calculate coordinates of all vessel voxels. For a given batch, pick a patch center from the foreground (vessel) voxels $P\%$ of the time, and a completely random center $(1-P)\%$ of the time. (e.g., $P=60\%$).
-- **Pros**: Ensures the model always sees vessels during training while still learning background context.
-- **Cons**: Patches might overlap heavily if sampled independently, showing the model redundant data.
-
-### Option C: Foreground-Aware + Non-Overlapping (or Low-Overlap) Sampling via IoU
-- **How it works**: Like Option B, but we also enforce a rule: before accepting a new patch for an epoch/batch, check its overlap (Intersection over Union, IoU) against already-chosen patches for that volume. Reject it if the overlap is too high.
-- **Pros**: Solves class imbalance *and* exact redundancy. Maximizes data efficiency.
-- **Cons**: Slightly more complex to implement and computationally heavy(requires tracking selected boxes and computing 3D IoU).
-
-### Option D: Foreground-Aware + Minimum Center Distance (Simplified Low-Overlap)
-- **How it works**: A simpler alternative to Option C. We track the center coordinates of patches already chosen for a given volume in the current epoch. If a newly sampled center is too close (e.g., Euclidean distance < half the patch size) to an existing center, we reject and resample.
-- **Pros**: Computationally much cheaper and simpler to implement than full volume IoU overlap checks. Effectively prevents severe redundancy.
-- **Cons**: Requires keeping state (a list of chosen centers) per volume during the epoch, and distance doesn't perfectly map to exact voxel overlap if aspect ratios vary.
-
-### Option E: Deterministic Grid (Tiling)
-- **How it works**: Divide the volume into a fixed grid of patches (often with slight overlap).
-- **Pros**: Guarantees coverage of the entire volume exactly once.
-- **Cons**: Lacks translation invariance (the network always sees vessels at the exact same relative grid offsets). Usually reserved for **Validation/Inference**, not training.
-
-### Selected Strategy: Option D 
-
-
-*Reasoning*:
-1. **Sparsity**: Vessels occupy a tiny fraction of the brain volume. Pure random sampling would result in "empty" patches >90% of the time.
-2. **Class Imbalance**: Forcing the center of the patch to be a vessel voxel ensures the model receives gradient signals for the challenging minority classes.
-3. **Redundancy Mitigation (Option D element)**: While true IoU non-overlap tracking (Option C) is complex for a simple dataloader, we can approximate it by simply keeping the patch size reasonably large and sampling fewer patches per volume per epoch, or explicitly implementing a minimum center distance check (Option D), naturally reducing the chance of severe overlap without needing an explicit IoU tracker.
-
-**Implementation Plan**:
-Modify the dataloader so that for a training crop, we first randomly decide if this crop should be "foreground" (e.g., 60% chance) or "background/random" (40% chance). If foreground, we pick a random non-zero voxel from the label array and center the patch on it.
+### Important note
+- CT normalization is not done on the fly in the dataloader.
+- The loader expects CT images in `training_data_resampled/` to already be normalized by `src/preprocess_resample.py`.
 
 ---
 
-## 7) Patch Size Selection
-
-When extracting 3D sub-volumes for training, we use a fixed patch size. Our baseline choices are typically `(96, 96, 96)` or `(128, 128, 128)`.
-
-*Reasoning for these sizes*:
-1. **Hardware Memory Limits (GPU VRAM)**: A full CTA volume (e.g., `332 x 417 x 184`) is too large to fit in GPU memory for a 3D U-Net, especially with 41 output classes. We must crop.
-2. **Anatomical Context**: The model needs to see enough surrounding tissue to distinguish *which* specific vessel it is looking at (e.g., distinguishing M1 from M2 based on branching). 
-   - A `96x96x96` patch at `0.4x0.4x0.75mm` spacing covers `~38x38x72mm` of physical space.
-   - A `128x128x128` patch covers `~51x51x96mm`, providing even more context, which is highly beneficial if GPU memory allows.
-3. **Network Architecture (Divisibility)**: 3D U-Nets use repeated downsampling (usually max pooling by 2). The patch dimensions should be cleanly divisible by $2^N$ (where $N$ is the number of pooling layers, e.g., 4 or 5) to ensure skip connections match perfectly in the decoder. Both 96 ($2^5 \times 3$) and 128 ($2^7$) are excellent choices.
-
-*Strategy*: Start with `(96, 96, 96)` to maximize context. If not enough we should increase!
-
----
-
-## 8) 3D U-Net Model Choice
+## 6) Model
 
 ### File
 - `src/model_3d_unet.py`
+
+### Purpose
+- Define the baseline compact 3D U-Net used in current experiments.
 
 ### Architecture implemented
 - Model class: `UNet3D(in_channels=1, num_classes=41, base_ch=16)`.
@@ -265,27 +255,102 @@ When extracting 3D sub-volumes for training, we use a fixed patch size. Our base
 
 ---
 
-## 9) Training sanity check
+## 7) Training
 
 ### File
 - `src/train.py`
 
 ### Purpose
-- Builds the current CTA dataloader from resampled data.
-- Instantiates the baseline `UNet3D`.
-- Runs a short optimization loop to confirm the full pipeline works end-to-end.
+- Run the current short sanity-check training loop on the preprocessed CTA dataset.
 
 ### Current runtime command
 - From project root:
   - `.venv/bin/python src/train.py`
 
 ### Notes
+- Builds the current CTA dataloader from resampled data.
+- Instantiates the baseline `UNet3D`.
+- Runs a short optimization loop to confirm the full pipeline works end-to-end.
 - This is intentionally a short sanity-check script, not a full experiment runner yet.
 - It is meant to catch data/model/loss wiring issues quickly before longer experiments.
+- Future work here includes adding epochs, validation, checkpointing, and metric logging.
 
 ---
 
-## 10) Alternative U-Net Architectures (and relevance to TopBrain CTA)
+## 8) Evaluation
+
+This stage is not fully implemented yet.
+
+### Current evaluation goals
+- Add quantitative validation metrics such as Dice and per-class Dice.
+- Save qualitative prediction overlays for validation cases.
+- Review failure cases on thin and small vessels.
+- Define what counts as a successful baseline compared with future experiments.
+
+---
+
+## 9) Experiments and ablations
+
+This section covers the main design choices to compare once the end-to-end baseline is running reliably.
+
+### A) Patch sampling strategy
+
+When loading 3D crops (patches) for training, we have a few options to ensure the model sees useful, non-redundant data.
+
+#### Option A: Pure Random Cropping
+- **How it works**: Pick random `(x, y, z)` starting coordinates for every patch.
+- **Pros**: Very easy to implement.
+- **Cons**: Brain vessels are sparse (most of the head is brain tissue, bone, or air). Pure random crops will yield many patches with only background (label `0`), leading to slow training and class imbalance.
+
+#### Option B: Foreground-Aware Cropping (Balanced Random)
+- **How it works**: Pre-calculate coordinates of all vessel voxels. For a given batch, pick a patch center from the foreground (vessel) voxels $P\%$ of the time, and a completely random center $(1-P)\%$ of the time. (e.g., $P=60\%$).
+- **Pros**: Ensures the model always sees vessels during training while still learning background context.
+- **Cons**: Patches might overlap heavily if sampled independently, showing the model redundant data.
+
+#### Option C: Foreground-Aware + Non-Overlapping (or Low-Overlap) Sampling via IoU
+- **How it works**: Like Option B, but we also enforce a rule: before accepting a new patch for an epoch/batch, check its overlap (Intersection over Union, IoU) against already-chosen patches for that volume. Reject it if the overlap is too high.
+- **Pros**: Solves class imbalance *and* exact redundancy. Maximizes data efficiency.
+- **Cons**: Slightly more complex to implement and computationally heavy(requires tracking selected boxes and computing 3D IoU).
+
+#### Option D: Foreground-Aware + Minimum Center Distance (Simplified Low-Overlap)
+- **How it works**: A simpler alternative to Option C. We track the center coordinates of patches already chosen for a given volume in the current epoch. If a newly sampled center is too close (e.g., Euclidean distance < half the patch size) to an existing center, we reject and resample.
+- **Pros**: Computationally much cheaper and simpler to implement than full volume IoU overlap checks. Effectively prevents severe redundancy.
+- **Cons**: Requires keeping state (a list of chosen centers) per volume during the epoch, and distance doesn't perfectly map to exact voxel overlap if aspect ratios vary.
+
+#### Option E: Deterministic Grid (Tiling)
+- **How it works**: Divide the volume into a fixed grid of patches (often with slight overlap).
+- **Pros**: Guarantees coverage of the entire volume exactly once.
+- **Cons**: Lacks translation invariance (the network always sees vessels at the exact same relative grid offsets). Usually reserved for **Validation/Inference**, not training.
+
+### Current choice: Option D 
+
+
+*Reasoning*:
+1. **Sparsity**: Vessels occupy a tiny fraction of the brain volume. Pure random sampling would result in "empty" patches >90% of the time.
+2. **Class Imbalance**: Forcing the center of the patch to be a vessel voxel ensures the model receives gradient signals for the challenging minority classes.
+3. **Redundancy Mitigation (Option D element)**: While true IoU non-overlap tracking (Option C) is complex for a simple dataloader, we can approximate it by simply keeping the patch size reasonably large and sampling fewer patches per volume per epoch, or explicitly implementing a minimum center distance check (Option D), naturally reducing the chance of severe overlap without needing an explicit IoU tracker.
+
+**Implementation Plan**:
+Modify the dataloader so that for a training crop, we first randomly decide if this crop should be "foreground" (e.g., 60% chance) or "background/random" (40% chance). If foreground, we pick a random non-zero voxel from the label array and center the patch on it.
+
+---
+
+### B) Patch size selection
+
+When extracting 3D sub-volumes for training, we use a fixed patch size. Our baseline choices are typically `(96, 96, 96)` or `(128, 128, 128)`.
+
+*Reasoning for these sizes*:
+1. **Hardware Memory Limits (GPU VRAM)**: A full CTA volume (e.g., `332 x 417 x 184`) is too large to fit in GPU memory for a 3D U-Net, especially with 41 output classes. We must crop.
+2. **Anatomical Context**: The model needs to see enough surrounding tissue to distinguish *which* specific vessel it is looking at (e.g., distinguishing M1 from M2 based on branching). 
+   - A `96x96x96` patch at `0.4x0.4x0.75mm` spacing covers `~38x38x72mm` of physical space.
+   - A `128x128x128` patch covers `~51x51x96mm`, providing even more context, which is highly beneficial if GPU memory allows.
+3. **Network Architecture (Divisibility)**: 3D U-Nets use repeated downsampling (usually max pooling by 2). The patch dimensions should be cleanly divisible by $2^N$ (where $N$ is the number of pooling layers, e.g., 4 or 5) to ensure skip connections match perfectly in the decoder. Both 96 ($2^5 \times 3$) and 128 ($2^7$) are excellent choices.
+
+*Strategy*: Start with `(96, 96, 96)` to maximize context. If not enough we should increase!
+
+---
+
+## 10) Future model variants
 
 This section discusses common U-Net variants that could replace or extend the current `UNet3D` baseline.
 
