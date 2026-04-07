@@ -52,10 +52,20 @@ These data folders are ignored by git, so collaborators need to download the dat
 
 ## Preprocess Once
 
-Run offline isotropic resampling once before training:
+Run offline preprocessing once before training (isotropic resampling + CT normalization):
 
 ```bash
 .venv/bin/python src/preprocess_resample.py --copy-metadata
+```
+
+Other useful variants:
+
+```bash
+# Explicit spacing
+.venv/bin/python src/preprocess_resample.py --sx 0.6 --sy 0.6 --sz 0.6 --copy-metadata
+
+# Process only CTA
+.venv/bin/python src/preprocess_resample.py --dataset topbrain_ct --copy-metadata
 ```
 
 This writes resampled data to:

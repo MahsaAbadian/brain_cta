@@ -12,10 +12,8 @@ The project is now organized in this order:
 5. Model
 6. Training
 7. Evaluation
-8. Experiments and ablations
-9. Future model variants
 
-## 1) Data inspection and validation
+## 1) Data inspection / validation
 
 ### File
 - `src/inspect_data.py`
@@ -44,11 +42,8 @@ The project is now organized in this order:
   - sagittal
   - coronal
   - axial
-- Uses anisotropic spacing-aware aspect ratios so slices are not distorted:
-  - `asp_sag = sz/sy`
-  - `asp_cor = sz/sx`
-  - `asp_ax = sy/sx`
-- Saves raw-data figures next to the script inside `src/`:
+- Displays slices with `aspect=1` to preserve voxel-grid view (no display aspect correction).
+- Saves raw-data figures to `data_inspection/`:
   - `inspect_data_slices.png` (CTA grayscale slices)
   - `inspect_data_labels.png` (label slices)
   - `inspect_data_overlay.png` (labels overlaid on CTA)
@@ -72,63 +67,46 @@ The project is now organized in this order:
 - `plt.show()` is intentionally commented out for non-GUI runs.
 - Script is path-safe from different working directories because it resolves:
   - `project_root = Path(__file__).resolve().parent.parent`
-  - output folder as script-local `src/`
+  - output folder as `project_root / "data_inspection"`
 
 ---
 
-## 2) Shared helpers for preprocessing and loading
+## 2) One-time preprocessing: resampling + CT normalization
 
 ### File
-- `src/data_utils.py`
+- `src/preprocess_resample.py`
 
-### Functions currently present
+### Purpose
+- Read voxel spacing from each case's NIfTI affine.
+- Resample images and labels once to the target spacing (default `0.6, 0.6, 0.6` mm).
+- Apply CT normalization offline (clip to HU window and normalize to `[0, 1]`) for CT datasets.
+- Save training-ready data to `training_data_resampled/` so runtime training stays fast and consistent.
 
-This file contains the shared helper functions used by the preprocessing and loading stages. The one-time preprocessing stage now consists of isotropic resampling plus CT intensity normalization.
+### Recommended command (from project root)
+- `.venv/bin/python src/preprocess_resample.py --copy-metadata`
 
-#### `extract_case_ids(image_dir, label_dir, image_suffix="_0000.nii.gz", label_suffix=".nii.gz")`
-- Intention:
-  - Build CTA case IDs by matching label files with corresponding image files.
-- Current behavior:
-  - Iterates label files in `label_dir`
-  - Derives case ID from label filename
-  - Checks whether corresponding image exists in `image_dir`
-  - Appends case IDs and logs errors for missing image files
+### Other common command variants
+- Explicit spacing:
+  - `.venv/bin/python src/preprocess_resample.py --sx 0.6 --sy 0.6 --sz 0.6 --copy-metadata`
+- Process only one dataset suffix:
+  - `.venv/bin/python src/preprocess_resample.py --dataset topbrain_ct --copy-metadata`
+- Process both CT and MR explicitly:
+  - `.venv/bin/python src/preprocess_resample.py --dataset topbrain_ct --dataset topbrain_mr --copy-metadata`
 
-#### `split_and_save(case_ids, split_ratio=0.8, output_dir=Path("training_data/split"))`
-- Shuffles the input case ID list.
-- Splits by ratio (default 80/20).
-- Saves:
-  - `training_data/split/train_cases.txt`
-  - `training_data/split/val_cases.txt`
-- Returns `(train_ids, val_ids)`.
+### Output structure
+- `training_data_resampled/imagesTr_*`
+- `training_data_resampled/labelsTr_*`
+- `training_data_resampled/split`
+- `training_data_resampled/itksnap_labelmap_txt`
+- `training_data_resampled/README.txt`
+- `training_data_resampled/License.txt`
 
-#### `load_split_ids(output_dir)`
-- Loads split files from `output_dir`.
-- Returns `(train_ids, val_ids)`.
-
-#### `preprocess_ct(x, low=-100.0, high=400.0)`
-- Clips CT intensities to `[low, high]`.
-- Normalizes to `[0, 1]` using min-max scaling.
-- Casts to `np.float32`.
-- Currently reused in:
-  - `src/inspect_data.py`
-  - `src/preprocess_resample.py`
-- CT normalization is now part of the one-time offline preprocessing step.
-
-#### `spacing_from_affine(affine)`
-- Extracts voxel spacing directly from a NIfTI affine.
-- Used by the offline resampling pipeline.
-
-#### `resample_to_spacing(volume, current_spacing, target_spacing, is_label)`
-- Resamples a volume to the requested spacing.
-- Uses linear interpolation for images and nearest-neighbor interpolation for labels.
-
-#### Script mode (`if __name__ == "__main__":`)
-- Uses CTA folders:
-  - `training_data/imagesTr_topbrain_ct`
-  - `training_data/labelsTr_topbrain_ct`
-- Runs extraction + split save.
-- Prints counts and first few examples.
+### Shared helper functions used by preprocessing
+- Core helpers live in `src/data_utils.py`:
+  - `preprocess_ct(...)`
+  - `spacing_from_affine(...)`
+  - `resample_to_spacing(...)`
+- These helpers are consumed by `src/preprocess_resample.py` and reused by inspection where needed.
 
 ---
 
@@ -159,47 +137,7 @@ After running `src/preprocess_resample.py`, the next step is to inspect the save
 
 ---
 
-## 4) One-time preprocessing: resampling + CT normalization
-
-### File
-- `src/preprocess_resample.py`
-
-### Purpose
-- Read per-case spacing from NIfTI affine.
-- Resample image/label once to a fixed target spacing.
-- Apply CT intensity normalization once during preprocessing.
-- Save resampled pairs to a new dataset root (no repeated on-the-fly resampling each epoch).
-
-### Default command (all matched datasets)
-- `.venv/bin/python src/preprocess_resample.py`
-
-### Optional custom spacing
-- `.venv/bin/python src/preprocess_resample.py --sx 0.6 --sy 0.6 --sz 0.6`
-
-### Optional: process explicit dataset suffixes only
-- `.venv/bin/python src/preprocess_resample.py --dataset topbrain_ct --dataset topbrain_mr`
-
-### Optional: copy split + label maps into resampled root
-- `.venv/bin/python src/preprocess_resample.py --copy-metadata`
-
-### Output layout (default root)
-- `training_data_resampled/imagesTr_*`
-- `training_data_resampled/labelsTr_*`
-- `training_data_resampled/split`
-- `training_data_resampled/itksnap_labelmap_txt`
-- `training_data_resampled/README.txt`
-- `training_data_resampled/License.txt`
-
-### What this means in practice
-- Raw source data stays in `training_data/`.
-- Training-ready data and metadata are written to `training_data_resampled/`.
-- This one-time preprocessing step now includes both resampling and CT normalization.
-- After resampling, training should use only the `training_data_resampled/` root.
-
-
----
-
-## 5) Data loading
+## 4) Data loading
 
 ### File
 - `src/data_loader.py`
@@ -216,7 +154,7 @@ After running `src/preprocess_resample.py`, the next step is to inspect the save
 
 ---
 
-## 6) Model
+## 5) Model
 
 ### File
 - `src/model_3d_unet.py`
@@ -255,29 +193,31 @@ After running `src/preprocess_resample.py`, the next step is to inspect the save
 
 ---
 
-## 7) Training
+## 6) Training
 
 ### File
 - `src/train.py`
 
 ### Purpose
-- Run the current short sanity-check training loop on the preprocessed CTA dataset.
+- Run full baseline training on the preprocessed CTA dataset.
+- Includes epoch loop, validation, checkpoint saving, and metric logging.
 
 ### Current runtime command
 - From project root:
   - `.venv/bin/python src/train.py`
+  - `.venv/bin/python src/train.py --epochs 40 --out-dir runs/baseline_e40`
+  - `.venv/bin/python src/train_sanity_check.py` (quick pipeline smoke test)
 
 ### Notes
-- Builds the current CTA dataloader from resampled data.
-- Instantiates the baseline `UNet3D`.
-- Runs a short optimization loop to confirm the full pipeline works end-to-end.
-- This is intentionally a short sanity-check script, not a full experiment runner yet.
-- It is meant to catch data/model/loss wiring issues quickly before longer experiments.
-- Future work here includes adding epochs, validation, checkpointing, and metric logging.
+- Builds CTA train/val loaders from `training_data_resampled/`.
+- Uses `UNet3D` + `DiceCELoss` objective.
+- Logs per-epoch metrics to `metrics.csv`.
+- Saves `checkpoint_latest.pt`, `checkpoint_best.pt`, and optional periodic epoch checkpoints.
+- Detailed argument and loss documentation is now in `TRAINING.md`.
 
 ---
 
-## 8) Evaluation
+## 7) Evaluation
 
 This stage is not fully implemented yet.
 
@@ -289,7 +229,7 @@ This stage is not fully implemented yet.
 
 ---
 
-## 9) Experiments and ablations
+## Experiments and ablations
 
 This section covers the main design choices to compare once the end-to-end baseline is running reliably.
 
@@ -350,7 +290,7 @@ When extracting 3D sub-volumes for training, we use a fixed patch size. Our base
 
 ---
 
-## 10) Future model variants
+## Future model variants
 
 This section discusses common U-Net variants that could replace or extend the current `UNet3D` baseline.
 

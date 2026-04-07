@@ -2,3 +2,4 @@ SimpleITK
 numpy
 scipy
 pytest
+nibabel
