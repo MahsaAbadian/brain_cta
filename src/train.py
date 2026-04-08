@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-val-patches-per-volume", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--base-ch", type=int, default=16)
+    parser.add_argument("--base-ch", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))

@@ -9,16 +9,16 @@ import torch.nn.functional as F
 
 
 class ConvBlock3D(nn.Module):
-    """(Conv3d -> BN -> ReLU) x2"""
+    """(Conv3d -> InstanceNorm -> ReLU) x2"""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.LeakyReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -27,28 +27,28 @@ class ConvBlock3D(nn.Module):
 
 class UNet3D(nn.Module):
     """
-    Small 3D U-Net.
-    Input:  (B, 1, D, H, W)
-    Output: (B, 41, D, H, W) logits
+    3D U-Net for multiclass vessel segmentation.
+    Default channels: 32 -> 64 -> 128 -> 256 -> 512 (bottleneck).
+    Uses InstanceNorm + LeakyReLU (stable with batch_size=1).
     """
-    def __init__(self, in_channels: int = 1, num_classes: int = 41, base_ch: int = 16):
+    def __init__(self, in_channels: int = 1, num_classes: int = 41, base_ch: int = 32):
         super().__init__()
 
         # Encoder
-        self.enc1 = ConvBlock3D(in_channels, base_ch)         # 16
+        self.enc1 = ConvBlock3D(in_channels, base_ch)
         self.pool1 = nn.MaxPool3d(2)
 
-        self.enc2 = ConvBlock3D(base_ch, base_ch * 2)         # 32
+        self.enc2 = ConvBlock3D(base_ch, base_ch * 2)
         self.pool2 = nn.MaxPool3d(2)
 
-        self.enc3 = ConvBlock3D(base_ch * 2, base_ch * 4)     # 64
+        self.enc3 = ConvBlock3D(base_ch * 2, base_ch * 4)
         self.pool3 = nn.MaxPool3d(2)
 
-        self.enc4 = ConvBlock3D(base_ch * 4, base_ch * 8)     # 128
+        self.enc4 = ConvBlock3D(base_ch * 4, base_ch * 8)
         self.pool4 = nn.MaxPool3d(2)
 
         # Bottleneck
-        self.bottleneck = ConvBlock3D(base_ch * 8, base_ch * 16)  # 256
+        self.bottleneck = ConvBlock3D(base_ch * 8, base_ch * 16)
 
         # Decoder (transpose conv upsample + skip concat + conv block)
         self.up4 = nn.ConvTranspose3d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
@@ -108,7 +108,7 @@ class UNet3D(nn.Module):
 
 if __name__ == "__main__":
     # quick shape sanity test
-    model = UNet3D(in_channels=1, num_classes=41, base_ch=16)
+    model = UNet3D(in_channels=1, num_classes=41, base_ch=32)
     x = torch.randn(2, 1, 96, 96, 96)  # (B, C, D, H, W)
     y = model(x)
     print("input :", x.shape)
