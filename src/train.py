@@ -27,6 +27,7 @@ class DiceCELoss(nn.Module):
         ce_weight: float = 1.0,
         include_background: bool = True,
         eps: float = 1e-6,
+        ce_class_weights: torch.Tensor | None = None,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -34,7 +35,7 @@ class DiceCELoss(nn.Module):
         self.ce_weight = ce_weight
         self.include_background = include_background
         self.eps = eps
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(weight=ce_class_weights)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # logits: (N, C, D, H, W), target: (N, D, H, W)
@@ -88,6 +89,42 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+def compute_class_weights(
+    label_dir: Path,
+    case_ids: list[str],
+    num_classes: int,
+) -> torch.Tensor:
+    """Inverse-sqrt-frequency class weights for CrossEntropyLoss.
+
+    Scans every training label volume, counts voxels per class, then returns
+    ``w[c] = 1 / sqrt(freq[c])`` normalised so the weights sum to
+    ``num_classes``.  Classes never seen get weight 0.
+    """
+    import nibabel as nib
+
+    counts = np.zeros(num_classes, dtype=np.float64)
+    for cid in case_ids:
+        lbl_path = label_dir / f"{cid}.nii.gz"
+        lbl = np.asanyarray(nib.load(str(lbl_path)).dataobj).astype(np.int64)
+        for val, cnt in zip(*np.unique(lbl, return_counts=True)):
+            if 0 <= val < num_classes:
+                counts[val] += cnt
+
+    total = counts.sum()
+    freq = counts / max(total, 1.0)
+
+    weights = np.zeros(num_classes, dtype=np.float64)
+    nonzero = freq > 0
+    weights[nonzero] = 1.0 / np.sqrt(freq[nonzero])
+
+    # Normalise so weights sum to num_classes (keeps loss magnitude stable).
+    w_sum = weights.sum()
+    if w_sum > 0:
+        weights *= num_classes / w_sum
+
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def _set_seed(seed: int) -> None:
@@ -314,6 +351,8 @@ def main() -> int:
     metrics_csv = out_dir / "metrics.csv"
 
     patch_size = tuple(int(x) for x in args.patch_size)
+    label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
+
     if args.overfit_case_id:
         train_loader, val_loader, num_classes = _build_overfit_loaders(
             case_id=args.overfit_case_id,
@@ -324,30 +363,37 @@ def main() -> int:
             num_val_patches_per_volume=args.num_val_patches_per_volume,
             disable_augment=args.overfit_disable_augment,
         )
+        train_case_ids = [args.overfit_case_id]
         print(
             "overfit mode enabled: "
             f"case_id={args.overfit_case_id} "
             f"augment={'off' if args.overfit_disable_augment else 'on'}"
         )
     else:
-        _, _, train_loader, val_loader, num_classes = build_train_val_loaders(
+        train_ds, _, train_loader, val_loader, num_classes = build_train_val_loaders(
             patch_size=patch_size,
             num_patches_per_volume=args.num_patches_per_volume,
             num_val_patches_per_volume=args.num_val_patches_per_volume,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
         )
+        train_case_ids = train_ds.case_ids
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
         f"train_batches={len(train_loader)} val_batches={len(val_loader)}"
     )
+
+    ce_weights = compute_class_weights(label_dir, train_case_ids, num_classes).to(device)
+    print(f"CE class weights (bg={ce_weights[0]:.3f}, min_fg={ce_weights[1:].min():.3f}, "
+          f"max_fg={ce_weights[1:].max():.3f})")
 
     model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
     criterion = DiceCELoss(
         num_classes=num_classes,
         dice_weight=1.0,
         ce_weight=1.0,
-        include_background=True,
+        include_background=False,
+        ce_class_weights=ce_weights,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
