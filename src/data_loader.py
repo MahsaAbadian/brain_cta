@@ -118,42 +118,71 @@ def sample_val_patches_deterministic(
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """
     Deterministic validation patch sampling.
-    Uses an evenly spaced 3D grid of patch starts and returns the first num_patches.
+
+    When foreground exists (the common case for CoW segmentation, where vessels
+    occupy ~0.5% of the volume), we place patches directly on foreground voxels:
+    we evenly subsample the sorted list of foreground voxel coordinates and clamp
+    each patch so it stays fully inside the volume.  This guarantees every patch
+    contains foreground and is fully repeatable.
+
+    Fallback: if the label has no foreground at all, we fall back to a dense 3D
+    grid (5 steps per axis) so the function always returns num_patches patches.
     """
     if num_patches < 1:
         raise ValueError(f"num_patches must be >= 1, got {num_patches}")
 
     px, py, pz = patch_size
-    sx_max = image.shape[0] - px
-    sy_max = image.shape[1] - py
-    sz_max = image.shape[2] - pz
+    x, y, z = image.shape
+    sx_max = x - px
+    sy_max = y - py
+    sz_max = z - pz
 
     if sx_max < 0 or sy_max < 0 or sz_max < 0:
         raise ValueError(
             f"Patch size {patch_size} is larger than volume shape {image.shape}"
         )
 
-    n_axis = max(1, math.ceil(num_patches ** (1.0 / 3.0)))
+    fg_indices = np.argwhere(label > 0)  # shape (N, 3)
+
+    if len(fg_indices) > 0:
+        # Evenly subsample foreground voxels so patches are spread across the
+        # structure rather than all clustered at the very first voxel.
+        step = max(1, len(fg_indices) // num_patches)
+        selected = fg_indices[::step][:num_patches]
+
+        out_images: list[np.ndarray] = []
+        out_labels: list[np.ndarray] = []
+        for cx, cy, cz in selected:
+            # Centre the patch on the foreground voxel, then clamp to volume.
+            sx = int(np.clip(cx - px // 2, 0, sx_max))
+            sy = int(np.clip(cy - py // 2, 0, sy_max))
+            sz = int(np.clip(cz - pz // 2, 0, sz_max))
+            out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
+            out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
+        return out_images, out_labels
+
+    # Fallback for label-free volumes: dense grid (5 steps per axis).
+    n_axis = 5
 
     def _starts(max_start: int) -> list[int]:
         if max_start == 0:
             return [0]
         vals = np.linspace(0, max_start, num=n_axis)
-        # Round to integer voxel starts and keep unique sorted starts.
         return sorted(set(int(round(v)) for v in vals))
 
     xs = _starts(sx_max)
     ys = _starts(sy_max)
     zs = _starts(sz_max)
 
-    out_images: list[np.ndarray] = []
-    out_labels: list[np.ndarray] = []
-    for sx, sy, sz in product(xs, ys, zs):
+    candidates: list[tuple[int, int, int]] = [
+        (sx, sy, sz) for sx, sy, sz in product(xs, ys, zs)
+    ]
+
+    out_images = []
+    out_labels = []
+    for sx, sy, sz in candidates[:num_patches]:
         out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
         out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
-        if len(out_images) >= num_patches:
-            break
-
     return out_images, out_labels
 
 

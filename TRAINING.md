@@ -95,7 +95,8 @@ During validation, script computes:
 - `val_loss`: same objective as training loss.
 - `val_mean_fg_dice`: mean Dice across foreground classes (`1..num_classes-1`) only when class exists in batch.
 - `per_class_dice`: class-wise Dice list (used for debug print on first epoch).
-- Validation patches are deterministic (default: 4 patches per case).
+- Validation patches are deterministic (default: 4 patches per case) and selected
+  from a fixed grid by highest foreground content.
 
 ## CLI Parameters (`src/train.py`)
 

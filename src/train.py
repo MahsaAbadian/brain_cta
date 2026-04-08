@@ -113,20 +113,33 @@ def _compute_per_class_dice(
     pred: torch.Tensor,
     target: torch.Tensor,
     num_classes: int,
-    eps: float = 1e-6,
 ) -> tuple[list[float], list[int]]:
+    """Per-class Dice using the nnU-Net / MONAI / challenge-leaderboard convention.
+
+    Edge cases (no smoothing epsilon — exact set comparison):
+      * Both empty  → Dice = 1.0  (perfect agreement on absence)
+      * One empty   → Dice = 0.0  (false positive or false negative)
+      * Both present → 2|P∩G| / (|P|+|G|)
+    Every class is always counted as a valid observation.
+    """
     dice_vals: list[float] = []
     valid_counts: list[int] = []
     for c in range(num_classes):
         pred_c = pred == c
         tgt_c = target == c
-        denom = pred_c.sum().item() + tgt_c.sum().item()
+        pred_count = pred_c.sum().item()
+        tgt_count = tgt_c.sum().item()
+        if pred_count == 0 and tgt_count == 0:
+            dice_vals.append(1.0)
+            valid_counts.append(1)
+            continue
+        denom = pred_count + tgt_count
         if denom == 0:
-            dice_vals.append(0.0)
-            valid_counts.append(0)
+            dice_vals.append(1.0)
+            valid_counts.append(1)
             continue
         inter = (pred_c & tgt_c).sum().item()
-        dice = (2.0 * inter + eps) / (denom + eps)
+        dice = (2.0 * inter) / denom
         dice_vals.append(float(dice))
         valid_counts.append(1)
     return dice_vals, valid_counts
