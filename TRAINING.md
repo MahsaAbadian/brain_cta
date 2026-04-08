@@ -95,6 +95,7 @@ During validation, script computes:
 - `val_loss`: same objective as training loss.
 - `val_mean_fg_dice`: mean Dice across foreground classes (`1..num_classes-1`) only when class exists in batch.
 - `per_class_dice`: class-wise Dice list (used for debug print on first epoch).
+- Validation patches are deterministic (default: 4 patches per case).
 
 ## CLI Parameters (`src/train.py`)
 
@@ -103,12 +104,15 @@ During validation, script computes:
 - `--num-workers` (default: `0`): dataloader worker processes.
 - `--patch-size` (default: `96 96 96`): patch size `(D, H, W)` style tuple in code order `(x, y, z)`.
 - `--num-patches-per-volume` (default: `2`): training patches sampled per volume.
+- `--num-val-patches-per-volume` (default: `4`): deterministic validation patches sampled per volume.
 - `--lr` (default: `2e-4`): AdamW learning rate.
 - `--weight-decay` (default: `1e-5`): AdamW weight decay.
 - `--base-ch` (default: `16`): base channels of U-Net.
 - `--seed` (default: `42`): random seed for Python, NumPy, and PyTorch.
 - `--save-every` (default: `1`): save epoch checkpoint every N epochs (`<=0` disables periodic epoch checkpoints).
 - `--out-dir` (default: `runs/baseline`): output directory for metrics and checkpoints.
+- `--overfit-case-id` (default: none): debug mode that uses one case for both train and val to test memorization.
+- `--overfit-disable-augment` (default: off): in overfit mode, disable random training flips.
 
 ## Scheduler and Optimizer
 
@@ -153,6 +157,22 @@ Use a unique output folder per experiment:
 ```
 
 This avoids overwriting previous metrics/checkpoints.
+
+## Overfit Sanity Mode (debug)
+
+Use this mode to verify the pipeline can memorize one case. This is intentionally not a fair validation setup.
+
+```bash
+.venv/bin/python src/train.py \
+  --overfit-case-id topcow_ct_005 \
+  --overfit-disable-augment \
+  --epochs 40 \
+  --num-patches-per-volume 8 \
+  --num-val-patches-per-volume 8 \
+  --out-dir runs/overfit_topcow_ct_005
+```
+
+Expected behavior: train loss drops quickly and `val_mean_fg_dice` rises much higher than normal split runs.
 
 ## Common Issues
 

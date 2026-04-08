@@ -3,6 +3,8 @@ from __future__ import annotations
 """Patch-based dataset and dataloader utilities for training on preprocessed data."""
 
 import random
+import math
+from itertools import product
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -16,7 +18,6 @@ from data_utils import (
     load_split_ids,
     split_and_save,
     random_crop_3d, 
-    center_crop_3d,
     read_num_classes_from_labelmap,
 )
 
@@ -109,6 +110,53 @@ def sample_patches_option_d(
     return out_images, out_labels
 
 
+def sample_val_patches_deterministic(
+    image: np.ndarray,
+    label: np.ndarray,
+    patch_size: tuple[int, int, int],
+    num_patches: int = 4,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """
+    Deterministic validation patch sampling.
+    Uses an evenly spaced 3D grid of patch starts and returns the first num_patches.
+    """
+    if num_patches < 1:
+        raise ValueError(f"num_patches must be >= 1, got {num_patches}")
+
+    px, py, pz = patch_size
+    sx_max = image.shape[0] - px
+    sy_max = image.shape[1] - py
+    sz_max = image.shape[2] - pz
+
+    if sx_max < 0 or sy_max < 0 or sz_max < 0:
+        raise ValueError(
+            f"Patch size {patch_size} is larger than volume shape {image.shape}"
+        )
+
+    n_axis = max(1, math.ceil(num_patches ** (1.0 / 3.0)))
+
+    def _starts(max_start: int) -> list[int]:
+        if max_start == 0:
+            return [0]
+        vals = np.linspace(0, max_start, num=n_axis)
+        # Round to integer voxel starts and keep unique sorted starts.
+        return sorted(set(int(round(v)) for v in vals))
+
+    xs = _starts(sx_max)
+    ys = _starts(sy_max)
+    zs = _starts(sz_max)
+
+    out_images: list[np.ndarray] = []
+    out_labels: list[np.ndarray] = []
+    for sx, sy, sz in product(xs, ys, zs):
+        out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
+        out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
+        if len(out_images) >= num_patches:
+            break
+
+    return out_images, out_labels
+
+
 class CTAPatchDataset(Dataset):
     """
     3D CTA patch dataset.
@@ -188,10 +236,14 @@ class CTAPatchDataset(Dataset):
             image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
             label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
         else:
-            # Validation uses a deterministic center crop for repeatability.
-            image, label = center_crop_3d(image, label, self.patch_size)
-            image_t = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
-            label_t = torch.from_numpy(label).long().unsqueeze(0)  # (1, D, H, W)
+            # Validation uses deterministic multi-patch sampling for repeatability.
+            images, labels = sample_val_patches_deterministic(
+                image, label, self.patch_size, num_patches=self.num_patches
+            )
+            out_img_tensors = [torch.from_numpy(img).float().unsqueeze(0) for img in images]
+            out_lbl_tensors = [torch.from_numpy(lbl).long() for lbl in labels]
+            image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
+            label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
 
         if label_t.min() < 0 or label_t.max() >= self.num_classes:
             raise ValueError(
@@ -211,6 +263,7 @@ def build_train_val_loaders(
     split_ratio: float = 0.8,
     patch_size: tuple[int, int, int] = (96, 96, 96),
     num_patches_per_volume: int = 4,
+    num_val_patches_per_volume: int = 4,
     batch_size: int = 1,
     num_workers: int = 0,
 ) -> tuple[CTAPatchDataset, CTAPatchDataset, DataLoader, DataLoader, int]:
@@ -270,7 +323,7 @@ def build_train_val_loaders(
         preprocess_fn=None,
         do_augment=False,
         num_classes=num_classes,
-        num_patches=1,
+        num_patches=num_val_patches_per_volume,
     )
 
     train_loader = DataLoader(

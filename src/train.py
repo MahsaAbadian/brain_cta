@@ -12,8 +12,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
-from data_loader import build_train_val_loaders
+from data_loader import CTAPatchDataset, build_train_val_loaders
+from data_utils import read_num_classes_from_labelmap
 from model_3d_unet import UNet3D
 
 
@@ -61,12 +63,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--patch-size", type=int, nargs=3, default=(96, 96, 96))
     parser.add_argument("--num-patches-per-volume", type=int, default=2)
+    parser.add_argument("--num-val-patches-per-volume", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--base-ch", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))
+    parser.add_argument(
+        "--overfit-case-id",
+        type=str,
+        default=None,
+        help=(
+            "Optional debug mode: use this single case ID for both train and val "
+            "(intentional leakage) to verify the model can overfit."
+        ),
+    )
+    parser.add_argument(
+        "--overfit-disable-augment",
+        action="store_true",
+        help=(
+            "Only used with --overfit-case-id. Disable training-time random flips "
+            "to make one-case memorization easier and debugging cleaner."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -210,6 +230,66 @@ def _save_checkpoint(
     )
 
 
+def _build_overfit_loaders(
+    *,
+    case_id: str,
+    patch_size: tuple[int, int, int],
+    batch_size: int,
+    num_workers: int,
+    num_patches_per_volume: int,
+    num_val_patches_per_volume: int,
+    disable_augment: bool,
+) -> tuple[DataLoader, DataLoader, int]:
+    image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
+    label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
+    labelmap_path = Path("training_data_resampled/itksnap_labelmap_txt/labelmap_topbrain_ct.txt")
+
+    image_path = image_dir / f"{case_id}_0000.nii.gz"
+    label_path = label_dir / f"{case_id}.nii.gz"
+    if not image_path.exists() or not label_path.exists():
+        raise FileNotFoundError(
+            f"Overfit case not found in resampled data: case_id={case_id} "
+            f"(expected {image_path} and {label_path})"
+        )
+
+    num_classes = read_num_classes_from_labelmap(labelmap_path)
+    train_ds = CTAPatchDataset(
+        case_ids=[case_id],
+        image_dir=image_dir,
+        label_dir=label_dir,
+        patch_size=patch_size,
+        mode="train",
+        preprocess_fn=None,
+        do_augment=not disable_augment,
+        num_classes=num_classes,
+        num_patches=num_patches_per_volume,
+    )
+    val_ds = CTAPatchDataset(
+        case_ids=[case_id],
+        image_dir=image_dir,
+        label_dir=label_dir,
+        patch_size=patch_size,
+        mode="val",
+        preprocess_fn=None,
+        do_augment=False,
+        num_classes=num_classes,
+        num_patches=num_val_patches_per_volume,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return train_loader, val_loader, num_classes
+
+
 def main() -> int:
     args = parse_args()
     _set_seed(args.seed)
@@ -221,12 +301,29 @@ def main() -> int:
     metrics_csv = out_dir / "metrics.csv"
 
     patch_size = tuple(int(x) for x in args.patch_size)
-    _, _, train_loader, val_loader, num_classes = build_train_val_loaders(
-        patch_size=patch_size,
-        num_patches_per_volume=args.num_patches_per_volume,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
+    if args.overfit_case_id:
+        train_loader, val_loader, num_classes = _build_overfit_loaders(
+            case_id=args.overfit_case_id,
+            patch_size=patch_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            num_patches_per_volume=args.num_patches_per_volume,
+            num_val_patches_per_volume=args.num_val_patches_per_volume,
+            disable_augment=args.overfit_disable_augment,
+        )
+        print(
+            "overfit mode enabled: "
+            f"case_id={args.overfit_case_id} "
+            f"augment={'off' if args.overfit_disable_augment else 'on'}"
+        )
+    else:
+        _, _, train_loader, val_loader, num_classes = build_train_val_loaders(
+            patch_size=patch_size,
+            num_patches_per_volume=args.num_patches_per_volume,
+            num_val_patches_per_volume=args.num_val_patches_per_volume,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
         f"train_batches={len(train_loader)} val_batches={len(val_loader)}"

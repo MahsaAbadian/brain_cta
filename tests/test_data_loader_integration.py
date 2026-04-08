@@ -112,5 +112,5 @@ def test_data_loader_shapes_and_label_bounds() -> None:
     assert tuple(batch_y.shape) == (1, 4, 96, 96, 96)
 
     val_x, val_y, _ = next(iter(val_loader))
-    assert tuple(val_x.shape) == (1, 1, 1, 96, 96, 96)
-    assert tuple(val_y.shape) == (1, 1, 96, 96, 96)
+    assert tuple(val_x.shape) == (1, 4, 1, 96, 96, 96)
+    assert tuple(val_y.shape) == (1, 4, 96, 96, 96)
