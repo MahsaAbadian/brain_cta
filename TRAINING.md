@@ -1,11 +1,12 @@
 # Training Guide
 
-This document explains how training works in this repository, including loss design, configurable parameters, logged outputs, and checkpoints.
+This document explains how training works in this repository, including loss definitions, metric definitions, configurable parameters, logged outputs, and checkpoints.
 
 ## Entry Points
 
 - Full training: `src/train.py`
 - Quick smoke test: `src/train_sanity_check.py`
+- Challenge-like local evaluation: `src/evaluate_challenge_like.py`
 
 Use full training for real experiments and use sanity check only for fast pipeline debugging.
 
@@ -44,15 +45,15 @@ Run the tiny sanity check:
 
 1. Build train/val loaders from resampled CTA data.
 2. Create `UNet3D` (`src/model_3d_unet.py`).
-3. Use combined Dice + CrossEntropy loss (`DiceCELoss`).
+3. Build weighted CE + soft Dice loss (`DiceCELoss`).
 4. Train one epoch (`train_one_epoch`).
 5. Validate one epoch (`validate_one_epoch`).
-6. Log metrics to CSV.
+6. Log metrics to CSV (including per-class Dice).
 7. Save checkpoints (`latest`, `best`, and periodic epoch checkpoints).
 
 ## Tensor Shapes
 
-The dataloader returns volume-batch + patch dimensions:
+The dataloader returns volume-batch plus patch dimensions:
 
 - Image batch from loader: `(B_volume, Patches, C, D, H, W)`
 - Label batch from loader: `(B_volume, Patches, D, H, W)`
@@ -66,60 +67,136 @@ Model output logits:
 
 - `(N, num_classes, D, H, W)`
 
-## Loss Function
+## Loss Approaches and Exact Calculations
 
 Loss class: `DiceCELoss` in `src/train.py`.
 
-Final loss:
+Final objective:
 
-- `total_loss = ce_weight * CrossEntropy + dice_weight * DiceLoss`
+- `total_loss = ce_weight * CE + dice_weight * DiceLoss`
 
-Where Dice loss is:
+### 1) Multiclass Cross Entropy (CE)
 
-- Softmax over classes on logits.
-- One-hot target expansion.
-- Per-class soft Dice computed over `(N, D, H, W)` volume elements.
-- Dice loss is `1 - mean(class_dice)`.
+For each voxel with true class `y` and logits `z_c`:
 
-Current defaults:
+- `p_c = softmax(z)_c`
+- `CE_voxel = -log(p_y)`
+
+With class weighting:
+
+- `CE_voxel_weighted = w_y * (-log(p_y))`
+
+Then PyTorch aggregates over all voxels/batch (`CrossEntropyLoss`, default reduction).
+
+### 2) CE Class Weights (inverse-sqrt frequency)
+
+Weights are computed from training labels only (`compute_class_weights`):
+
+1. Count voxels per class across train cases: `count_c`
+2. Convert to frequencies: `freq_c = count_c / sum(count)`
+3. Raw weights: `w_c = 1 / sqrt(freq_c)` for classes with `freq_c > 0`, else `0`
+4. Normalize to keep scale stable: `w <- w * (num_classes / sum(w))`
+5. Optional clamp: `w_c = clip(w_c, ce_weight_min, ce_weight_max)`
+
+Why this helps:
+
+- Rare classes get larger CE gradients.
+- Very common classes (especially background) get smaller CE gradients.
+- `--ce-weight-max` prevents extreme rare-class over-emphasis.
+
+### 3) Soft Dice Loss
+
+From logits:
+
+- `probs = softmax(logits, dim=1)`
+- `target_1h = one_hot(target)`
+
+If `include_background=False`, class `0` is removed from Dice term.
+
+For each class `c` (soft formulation):
+
+- `inter_c = sum(probs_c * target_c)`
+- `denom_c = sum(probs_c) + sum(target_c)`
+- `dice_c = (2 * inter_c + eps) / (denom_c + eps)`
+
+Dice loss is:
+
+- `DiceLoss = 1 - mean_c(dice_c)`
+
+### 4) Combined loss knobs
+
+- `--ce-weight`: scales CE term
+- `--dice-weight`: scales Dice term
+- `--ce-weight-min`, `--ce-weight-max`: clamp class weights
+
+Current default behavior in `src/train.py`:
 
 - `ce_weight = 1.0`
 - `dice_weight = 1.0`
-- `include_background = True`
-- `eps = 1e-6`
+- `include_background = False` (Dice term ignores class `0`)
+- CE uses computed class weights from training labels
 
-## Validation Metrics
+Useful tuning pattern for imbalanced classes:
 
-During validation, script computes:
+- reduce CE emphasis (`--ce-weight 0.3` to `0.5`)
+- cap rare-class boost (`--ce-weight-max 1.5` to `2.0`)
 
-- `val_loss`: same objective as training loss.
-- `val_mean_fg_dice`: mean Dice across foreground classes (`1..num_classes-1`) only when class exists in batch.
-- `per_class_dice`: class-wise Dice list (used for debug print on first epoch).
-- Validation patches are deterministic (default: 4 patches per case) and selected
-  from a fixed grid by highest foreground content.
+## Validation Metrics and Edge Cases
+
+Validation uses hard predictions from `argmax(logits)` and class-wise Dice.
+
+Per-class hard Dice convention (empty-aware):
+
+- GT empty and Pred empty -> `Dice = 1.0`
+- GT empty and Pred non-empty -> `Dice = 0.0`
+- GT non-empty and Pred empty -> `Dice = 0.0`
+- Both non-empty -> `Dice = 2TP / (2TP + FP + FN)`
+
+This can inflate means when many classes are absent.
+
+### Logged foreground means
+
+`validate_one_epoch` logs two foreground summaries:
+
+1. `val_mean_fg_dice` (present-only, primary)
+   - mean over foreground classes `1..C-1` where GT appears at least once in validation batches during that epoch
+   - best-checkpoint selection uses this metric
+
+2. `val_mean_fg_dice_all` (empty-aware, secondary)
+   - mean over all foreground classes regardless of GT presence
+   - useful diagnostic, but can be inflated by absent classes
+
+### Per-class logging
+
+- `per_class_dice` is printed every epoch (`c00=..., c01=..., ...`)
+- CSV stores `val_dice_c00` ... `val_dice_cXX`
 
 ## CLI Parameters (`src/train.py`)
 
-- `--epochs` (default: `10`): number of training epochs.
-- `--batch-size` (default: `1`): number of volumes per batch from loader.
+- `--epochs` (default: `40`): number of training epochs.
+- `--batch-size` (default: `1`): number of volumes per loader batch.
 - `--num-workers` (default: `0`): dataloader worker processes.
-- `--patch-size` (default: `96 96 96`): patch size `(D, H, W)` style tuple in code order `(x, y, z)`.
+- `--patch-size` (default: `96 96 96`): patch size tuple in code order `(x, y, z)`.
 - `--num-patches-per-volume` (default: `2`): training patches sampled per volume.
 - `--num-val-patches-per-volume` (default: `4`): deterministic validation patches sampled per volume.
 - `--lr` (default: `2e-4`): AdamW learning rate.
 - `--weight-decay` (default: `1e-5`): AdamW weight decay.
-- `--base-ch` (default: `16`): base channels of U-Net.
+- `--base-ch` (default: `32`): base channels of U-Net.
 - `--seed` (default: `42`): random seed for Python, NumPy, and PyTorch.
 - `--save-every` (default: `1`): save epoch checkpoint every N epochs (`<=0` disables periodic epoch checkpoints).
 - `--out-dir` (default: `runs/baseline`): output directory for metrics and checkpoints.
-- `--overfit-case-id` (default: none): debug mode that uses one case for both train and val to test memorization.
+- `--overfit-case-id` (default: none): debug mode that uses one case for both train and val.
 - `--overfit-disable-augment` (default: off): in overfit mode, disable random training flips.
+- `--dice-weight` (default: `1.0`): Dice term weight in total loss.
+- `--ce-weight` (default: `1.0`): CE term weight in total loss.
+- `--ce-weight-min` (default: none): minimum clamp for class weights.
+- `--ce-weight-max` (default: none): maximum clamp for class weights.
 
 ## Scheduler and Optimizer
 
 - Optimizer: `AdamW`
 - Scheduler: `CosineAnnealingLR(T_max=epochs, eta_min=1e-6)`
-- Scheduler steps once per epoch (after validation logging).
+- Scheduler steps once per epoch (after validation).
 
 ## Output Files
 
@@ -130,10 +207,59 @@ Inside `--out-dir`:
   - `lr`
   - `train_loss`
   - `val_loss`
-  - `val_mean_fg_dice`
+  - `val_mean_fg_dice` (present-only)
+  - `val_mean_fg_dice_all` (empty-aware)
+  - `val_dice_c00` ... `val_dice_cXX`
 - `checkpoint_latest.pt`: overwritten each epoch.
 - `checkpoint_best.pt`: updated when `val_mean_fg_dice` improves.
 - `checkpoint_epoch_XXX.pt`: periodic snapshots controlled by `--save-every`.
+
+## Challenge-Like Evaluation (TopBrain-style)
+
+Training-time patch Dice is useful for model iteration, but leaderboard scores are
+computed on full-volume predictions with additional topology/geometry metrics.
+
+Use `src/evaluate_challenge_like.py` to run full-case sliding-window inference on
+your validation split and export NIfTI predictions.
+
+1) Generate challenge-like prediction folders:
+
+```bash
+.venv/bin/python src/evaluate_challenge_like.py \
+  --checkpoint runs/exp_ps96_np4_ce05_clamp2/checkpoint_best.pt \
+  --out-dir runs/challenge_like_eval_exp1 \
+  --patch-size 96 96 96 \
+  --stride 64 64 64
+```
+
+This creates:
+
+- `runs/challenge_like_eval_exp1/predictions`
+- `runs/challenge_like_eval_exp1/ground-truth`
+
+2) Install official TopBrain evaluation package (optional but recommended):
+
+```bash
+.venv/bin/pip install git+https://github.com/CoWBenchmark/TopBrain_Eval_Metrics.git
+```
+
+3) Attempt automatic official-metric evaluation:
+
+```bash
+.venv/bin/python src/evaluate_challenge_like.py \
+  --checkpoint runs/exp_ps96_np4_ce05_clamp2/checkpoint_best.pt \
+  --out-dir runs/challenge_like_eval_exp1 \
+  --run-topbrain-eval \
+  --topbrain-track cta
+```
+
+Notes:
+
+- `--topbrain-track` is passed directly to `TopBrainEvaluation`. If your installed
+  package expects a different track string, the script will report that and still
+  keep generated predictions.
+- Full-volume evaluation is slower than patch validation, but is much closer to
+  challenge ranking behavior.
 
 ## Checkpoint Contents
 
@@ -143,7 +269,7 @@ Each checkpoint stores:
 - `model_state`
 - `optimizer_state`
 - `scheduler_state`
-- `best_val_dice`
+- `best_val_dice` (best present-only foreground Dice)
 
 ## Recommended Experiment Pattern
 
@@ -151,13 +277,18 @@ Use a unique output folder per experiment:
 
 ```bash
 .venv/bin/python src/train.py \
-  --epochs 30 \
+  --epochs 200 \
+  --lr 3e-4 \
   --patch-size 96 96 96 \
-  --num-patches-per-volume 2 \
-  --out-dir runs/baseline_ps96_np2_e30
+  --num-patches-per-volume 4 \
+  --num-val-patches-per-volume 4 \
+  --ce-weight 0.5 \
+  --dice-weight 1.0 \
+  --ce-weight-max 2.0 \
+  --out-dir runs/exp_ps96_np4_ce05_clamp2
 ```
 
-This avoids overwriting previous metrics/checkpoints.
+This avoids overwriting previous metrics and provides stable rare-class behavior.
 
 ## Overfit Sanity Mode (debug)
 
@@ -179,4 +310,5 @@ Expected behavior: train loss drops quickly and `val_mean_fg_dice` rises much hi
 
 - If training is very slow on CPU, reduce `--patch-size` and `--num-patches-per-volume` for debugging.
 - If OOM on GPU, reduce patch size and/or number of patches per volume.
-- If `num_classes` mismatch appears, check the label map file under `training_data_resampled/itksnap_labelmap_txt`.
+- If `num_classes` mismatch appears, check label map under `training_data_resampled/itksnap_labelmap_txt`.
+- If `val_mean_fg_dice_all` is high but `val_mean_fg_dice` is low, you are likely seeing empty-class inflation from absent labels.

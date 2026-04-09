@@ -251,13 +251,14 @@ def validate_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     num_classes: int,
-) -> tuple[float, float, list[float]]:
+) -> tuple[float, float, float, list[float]]:
     model.eval()
     running_loss = 0.0
     n_steps = 0
 
     per_class_sum = [0.0] * num_classes
     per_class_count = [0] * num_classes
+    per_class_gt_present_count = [0] * num_classes
 
     with torch.no_grad():
         for batch_x, batch_y, _ in loader:
@@ -278,6 +279,10 @@ def validate_one_epoch(
                 if valid_counts[c]:
                     per_class_sum[c] += dice_vals[c]
                     per_class_count[c] += 1
+                # Track whether class c appears in GT for this validation batch.
+                # This supports a present-only mean Dice that ignores empty GT classes.
+                if (batch_y == c).any().item():
+                    per_class_gt_present_count[c] += 1
 
     avg_loss = running_loss / max(n_steps, 1)
     per_class_dice = [
@@ -285,15 +290,28 @@ def validate_one_epoch(
         for c in range(num_classes)
     ]
 
-    # Mean foreground Dice (exclude background class 0).
-    fg_scores = [
+    # Mean foreground Dice over all foreground classes.
+    # With the empty-empty=1 convention, absent classes can inflate this value.
+    fg_scores_all = [
         per_class_dice[c]
         for c in range(1, num_classes)
         if per_class_count[c] > 0
     ]
-    mean_fg_dice = float(sum(fg_scores) / max(len(fg_scores), 1))
+    mean_fg_dice_all = float(sum(fg_scores_all) / max(len(fg_scores_all), 1))
 
-    return avg_loss, mean_fg_dice, per_class_dice
+    # Present-only foreground mean Dice: includes class c only if GT contains c
+    # in at least one validation batch this epoch. This is more robust when many
+    # classes are anatomically absent for a given split.
+    fg_scores_present_only = [
+        per_class_dice[c]
+        for c in range(1, num_classes)
+        if per_class_gt_present_count[c] > 0
+    ]
+    mean_fg_dice_present_only = float(
+        sum(fg_scores_present_only) / max(len(fg_scores_present_only), 1)
+    )
+
+    return avg_loss, mean_fg_dice_present_only, mean_fg_dice_all, per_class_dice
 
 
 def _save_checkpoint(
@@ -455,6 +473,7 @@ def main() -> int:
                 "train_loss",
                 "val_loss",
                 "val_mean_fg_dice",
+                "val_mean_fg_dice_all",
                 *[f"val_dice_c{c:02d}" for c in range(num_classes)],
             ]
         )
@@ -472,7 +491,7 @@ def main() -> int:
             optimizer=optimizer,
             device=device,
         )
-        val_loss, val_mean_fg_dice, per_class_dice = validate_one_epoch(
+        val_loss, val_mean_fg_dice, val_mean_fg_dice_all, per_class_dice = validate_one_epoch(
             model=model,
             loader=val_loader,
             criterion=criterion,
@@ -492,6 +511,7 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     f"{val_mean_fg_dice:.6f}",
+                    f"{val_mean_fg_dice_all:.6f}",
                     *[f"{d:.6f}" for d in per_class_dice],
                 ]
             )
@@ -529,6 +549,7 @@ def main() -> int:
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
             f"lr={lr:.2e} train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f} "
+            f"val_mean_fg_dice_all={val_mean_fg_dice_all:.6f} "
             f"time={elapsed:.1f}s"
         )
         print(
@@ -536,7 +557,7 @@ def main() -> int:
             + ", ".join(f"c{idx:02d}={d:.4f}" for idx, d in enumerate(per_class_dice))
         )
 
-    print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
+    print(f"\nTraining complete. Best val_mean_fg_dice(present_only)={best_val_dice:.6f}")
     print(f"Saved metrics: {metrics_csv}")
     print(f"Saved checkpoints: {latest_path}, {best_path}")
     return 0

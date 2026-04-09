@@ -7,6 +7,8 @@ import nibabel as nib
 from pathlib import Path
 import sys
 import matplotlib
+import re
+
 
 
 project_root = Path(__file__).resolve().parent.parent
@@ -24,12 +26,121 @@ parser.add_argument(
     action="store_true",
     help="Use this when inspecting data saved by src/preprocess_resample.py.",
 )
+parser.add_argument(
+    "--report-class-volumes",
+    action="store_true",
+    help=(
+        "Compute dataset-level average class volumes from labelsTr_topbrain_ct and "
+        "print a per-class table (voxels and mm^3)."
+    ),
+)
 args = parser.parse_args()
+
+
+def _parse_itksnap_label_names(labelmap_path: Path) -> dict[int, str]:
+    """Parse class index -> name from an ITK-SNAP labelmap file."""
+    if not labelmap_path.exists():
+        return {}
+
+    names: dict[int, str] = {}
+    line_re = re.compile(r'^\s*(\d+)\s+.*"([^"]+)"\s*$')
+    for line in labelmap_path.read_text().splitlines():
+        m = line_re.match(line)
+        if m is None:
+            continue
+        idx = int(m.group(1))
+        names[idx] = m.group(2)
+    return names
+
+
+def compute_average_class_volumes(
+    *,
+    labels_dir: Path,
+    labelmap_path: Path | None = None,
+) -> list[dict[str, float | int | str]]:
+    """Compute per-class average volume across all CTA label files.
+
+    Returns one row per class with:
+      - avg_voxels_per_case
+      - avg_mm3_per_case
+      - present_cases / num_cases
+    """
+    label_files = sorted(labels_dir.glob('*.nii.gz'))
+    if not label_files:
+        raise FileNotFoundError(f'No label files found in {labels_dir}')
+
+    # First pass: discover max class id across dataset.
+    max_class = 0
+    for p in label_files:
+        lbl = np.asanyarray(nib.load(str(p)).dataobj)
+        if lbl.size == 0:
+            continue
+        max_class = max(max_class, int(np.max(lbl)))
+
+    num_classes = max_class + 1
+    total_voxels = np.zeros(num_classes, dtype=np.float64)
+    total_mm3 = np.zeros(num_classes, dtype=np.float64)
+    present_cases = np.zeros(num_classes, dtype=np.int64)
+
+    for p in label_files:
+        nii = nib.load(str(p))
+        lbl = np.asanyarray(nii.dataobj).astype(np.int64)
+        spacing = np.sqrt(np.sum(nii.affine[:3, :3] ** 2, axis=0))
+        voxel_mm3 = float(np.prod(spacing))
+
+        cls_ids, counts = np.unique(lbl, return_counts=True)
+        for cls_id, cnt in zip(cls_ids.astype(int), counts.astype(np.int64)):
+            if cls_id < 0 or cls_id >= num_classes:
+                continue
+            total_voxels[cls_id] += float(cnt)
+            total_mm3[cls_id] += float(cnt) * voxel_mm3
+            present_cases[cls_id] += 1
+
+    num_cases = len(label_files)
+    names = _parse_itksnap_label_names(labelmap_path) if labelmap_path else {}
+
+    rows: list[dict[str, float | int | str]] = []
+    for c in range(num_classes):
+        rows.append(
+            {
+                'class_id': c,
+                'class_name': names.get(c, ''),
+                'present_cases': int(present_cases[c]),
+                'num_cases': num_cases,
+                'avg_voxels_per_case': float(total_voxels[c] / num_cases),
+                'avg_mm3_per_case': float(total_mm3[c] / num_cases),
+            }
+        )
+    return rows
+
+
+def print_average_class_volumes(rows: list[dict[str, float | int | str]]) -> None:
+    """Pretty-print per-class average volume table to stdout."""
+    print('\n=== Average Class Volumes (dataset-level, per case) ===')
+    print('class  name           present   avg_voxels/case   avg_mm3/case')
+    print('-----  -------------  -------  -----------------  --------------')
+    for r in rows:
+        cls_id = int(r['class_id'])
+        name = str(r['class_name']) if r['class_name'] else '-'
+        present = f"{int(r['present_cases'])}/{int(r['num_cases'])}"
+        avg_vox = float(r['avg_voxels_per_case'])
+        avg_mm3 = float(r['avg_mm3_per_case'])
+        print(f"{cls_id:>5}  {name[:13]:<13}  {present:>7}  {avg_vox:>17.1f}  {avg_mm3:>14.1f}")
+
 
 case_id = args.case_id
 data_root = project_root / args.data_root
 out_dir = project_root / "data_inspection"
 out_dir.mkdir(parents=True, exist_ok=True)
+
+if args.report_class_volumes:
+    labelmap_path = data_root / "itksnap_labelmap_txt" / "labelmap_topbrain_ct.txt"
+    labels_dir = data_root / "labelsTr_topbrain_ct"
+    rows = compute_average_class_volumes(
+        labels_dir=labels_dir,
+        labelmap_path=labelmap_path if labelmap_path.exists() else None,
+    )
+    print_average_class_volumes(rows)
 
 
 img_path = data_root / "imagesTr_topbrain_ct" / f"{case_id}_0000.nii.gz"
