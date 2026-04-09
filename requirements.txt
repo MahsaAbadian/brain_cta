@@ -3,3 +3,5 @@ numpy
 scipy
 pytest
 nibabel
+# Training (install before running src/train.py)
+torch

@@ -88,6 +88,30 @@ def parse_args() -> argparse.Namespace:
             "to make one-case memorization easier and debugging cleaner."
         ),
     )
+    parser.add_argument(
+        "--dice-weight",
+        type=float,
+        default=1.0,
+        help="Weight for Dice term inside DiceCELoss.",
+    )
+    parser.add_argument(
+        "--ce-weight",
+        type=float,
+        default=1.0,
+        help="Weight for CE term inside DiceCELoss.",
+    )
+    parser.add_argument(
+        "--ce-weight-min",
+        type=float,
+        default=None,
+        help="Optional minimum clamp for CE class weights after normalization.",
+    )
+    parser.add_argument(
+        "--ce-weight-max",
+        type=float,
+        default=None,
+        help="Optional maximum clamp for CE class weights after normalization.",
+    )
     return parser.parse_args()
 
 
@@ -95,12 +119,16 @@ def compute_class_weights(
     label_dir: Path,
     case_ids: list[str],
     num_classes: int,
+    clamp_min: float | None = None,
+    clamp_max: float | None = None,
 ) -> torch.Tensor:
     """Inverse-sqrt-frequency class weights for CrossEntropyLoss.
 
     Scans every training label volume, counts voxels per class, then returns
-    ``w[c] = 1 / sqrt(freq[c])`` normalised so the weights sum to
-    ``num_classes``.  Classes never seen get weight 0.
+    ``w[c] = 1 / sqrt(freq[c])`` normalized so the weights sum to
+    ``num_classes``. Classes never seen get weight 0.
+
+    Optional clamp_min/clamp_max can tame extreme rare-class emphasis.
     """
     import nibabel as nib
 
@@ -119,10 +147,19 @@ def compute_class_weights(
     nonzero = freq > 0
     weights[nonzero] = 1.0 / np.sqrt(freq[nonzero])
 
-    # Normalise so weights sum to num_classes (keeps loss magnitude stable).
+    # Normalize so weights sum to num_classes (keeps loss magnitude stable).
     w_sum = weights.sum()
     if w_sum > 0:
         weights *= num_classes / w_sum
+
+    if clamp_min is not None or clamp_max is not None:
+        lo = clamp_min if clamp_min is not None else -np.inf
+        hi = clamp_max if clamp_max is not None else np.inf
+        if lo > hi:
+            raise ValueError(
+                f"Invalid CE clamp range: min={clamp_min} > max={clamp_max}"
+            )
+        weights = np.clip(weights, lo, hi)
 
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -383,15 +420,24 @@ def main() -> int:
         f"train_batches={len(train_loader)} val_batches={len(val_loader)}"
     )
 
-    ce_weights = compute_class_weights(label_dir, train_case_ids, num_classes).to(device)
-    print(f"CE class weights (bg={ce_weights[0]:.3f}, min_fg={ce_weights[1:].min():.3f}, "
-          f"max_fg={ce_weights[1:].max():.3f})")
+    ce_weights = compute_class_weights(
+        label_dir,
+        train_case_ids,
+        num_classes,
+        clamp_min=args.ce_weight_min,
+        clamp_max=args.ce_weight_max,
+    ).to(device)
+    print(
+        f"CE class weights (bg={ce_weights[0]:.3f}, min_fg={ce_weights[1:].min():.3f}, "
+        f"max_fg={ce_weights[1:].max():.3f}, clamp_min={args.ce_weight_min}, "
+        f"clamp_max={args.ce_weight_max})"
+    )
 
     model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
     criterion = DiceCELoss(
         num_classes=num_classes,
-        dice_weight=1.0,
-        ce_weight=1.0,
+        dice_weight=args.dice_weight,
+        ce_weight=args.ce_weight,
         include_background=False,
         ce_class_weights=ce_weights,
     )
@@ -409,6 +455,7 @@ def main() -> int:
                 "train_loss",
                 "val_loss",
                 "val_mean_fg_dice",
+                *[f"val_dice_c{c:02d}" for c in range(num_classes)],
             ]
         )
 
@@ -445,6 +492,7 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     f"{val_mean_fg_dice:.6f}",
+                    *[f"{d:.6f}" for d in per_class_dice],
                 ]
             )
 
@@ -483,11 +531,10 @@ def main() -> int:
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f} "
             f"time={elapsed:.1f}s"
         )
-        if epoch == 1:
-            print(
-                "per_class_dice sample (classes 0..5): "
-                + ", ".join(f"{d:.4f}" for d in per_class_dice[:6])
-            )
+        print(
+            "per_class_dice: "
+            + ", ".join(f"c{idx:02d}={d:.4f}" for idx, d in enumerate(per_class_dice))
+        )
 
     print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
     print(f"Saved metrics: {metrics_csv}")
