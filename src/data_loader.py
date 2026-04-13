@@ -3,8 +3,6 @@ from __future__ import annotations
 """Patch-based dataset and dataloader utilities for training on preprocessed data."""
 
 import random
-import math
-from itertools import product
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -17,7 +15,6 @@ from data_utils import (
     extract_case_ids,
     load_split_ids,
     split_and_save,
-    random_crop_3d, 
     read_num_classes_from_labelmap,
 )
 
@@ -182,82 +179,6 @@ def compute_rare_class_sampling_weights(
     return weights.astype(np.float32)
 
 
-def sample_val_patches_deterministic(
-    image: np.ndarray,
-    label: np.ndarray,
-    patch_size: tuple[int, int, int],
-    num_patches: int = 4,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """
-    Deterministic validation patch sampling.
-
-    When foreground exists (the common case for CoW segmentation, where vessels
-    occupy ~0.5% of the volume), we place patches directly on foreground voxels:
-    we evenly subsample the sorted list of foreground voxel coordinates and clamp
-    each patch so it stays fully inside the volume.  This guarantees every patch
-    contains foreground and is fully repeatable.
-
-    Fallback: if the label has no foreground at all, we fall back to a dense 3D
-    grid (5 steps per axis) so the function always returns num_patches patches.
-    """
-    if num_patches < 1:
-        raise ValueError(f"num_patches must be >= 1, got {num_patches}")
-
-    px, py, pz = patch_size
-    x, y, z = image.shape
-    sx_max = x - px
-    sy_max = y - py
-    sz_max = z - pz
-
-    if sx_max < 0 or sy_max < 0 or sz_max < 0:
-        raise ValueError(
-            f"Patch size {patch_size} is larger than volume shape {image.shape}"
-        )
-
-    fg_indices = np.argwhere(label > 0)  # shape (N, 3)
-
-    if len(fg_indices) > 0:
-        # Evenly subsample foreground voxels so patches are spread across the
-        # structure rather than all clustered at the very first voxel.
-        step = max(1, len(fg_indices) // num_patches)
-        selected = fg_indices[::step][:num_patches]
-
-        out_images: list[np.ndarray] = []
-        out_labels: list[np.ndarray] = []
-        for cx, cy, cz in selected:
-            # Centre the patch on the foreground voxel, then clamp to volume.
-            sx = int(np.clip(cx - px // 2, 0, sx_max))
-            sy = int(np.clip(cy - py // 2, 0, sy_max))
-            sz = int(np.clip(cz - pz // 2, 0, sz_max))
-            out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
-            out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
-        return out_images, out_labels
-
-    # Fallback for label-free volumes: dense grid (5 steps per axis).
-    n_axis = 5
-
-    def _starts(max_start: int) -> list[int]:
-        if max_start == 0:
-            return [0]
-        vals = np.linspace(0, max_start, num=n_axis)
-        return sorted(set(int(round(v)) for v in vals))
-
-    xs = _starts(sx_max)
-    ys = _starts(sy_max)
-    zs = _starts(sz_max)
-
-    candidates: list[tuple[int, int, int]] = [
-        (sx, sy, sz) for sx, sy, sz in product(xs, ys, zs)
-    ]
-
-    out_images = []
-    out_labels = []
-    for sx, sy, sz in candidates[:num_patches]:
-        out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
-        out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
-    return out_images, out_labels
-
-
 class CTAPatchDataset(Dataset):
     """
     3D CTA patch dataset.
@@ -274,7 +195,6 @@ class CTAPatchDataset(Dataset):
         image_dir: Path,
         label_dir: Path,
         patch_size: tuple[int, int, int] = (128, 128, 128),
-        mode: str = "train",
         preprocess_fn: Callable[[np.ndarray], np.ndarray] | None = None,
         do_augment: bool = True,
         num_classes: int = 41,
@@ -282,15 +202,12 @@ class CTAPatchDataset(Dataset):
         rare_class_prob: float = 0.0,
         rare_class_weights: np.ndarray | None = None,
     ) -> None:
-        if mode not in ("train", "val"):
-            raise ValueError(f"mode must be 'train' or 'val', got {mode}")
         self.case_ids = list(case_ids)
         self.image_dir = image_dir
         self.label_dir = label_dir
         self.patch_size = patch_size
-        self.mode = mode
         self.preprocess_fn = preprocess_fn
-        self.do_augment = do_augment and mode == "train"
+        self.do_augment = do_augment
         self.num_classes = num_classes
         self.num_patches = num_patches
         self.rare_class_prob = float(np.clip(rare_class_prob, 0.0, 1.0))
@@ -326,34 +243,24 @@ class CTAPatchDataset(Dataset):
                     f"Patch size {self.patch_size} is larger than volume shape {image.shape} for {case_id}"
                 )
 
-        if self.mode == "train":
-            images, labels = sample_patches_option_d(
-                image,
-                label,
-                self.patch_size,
-                num_patches=self.num_patches,
-                rare_class_prob=self.rare_class_prob,
-                rare_class_weights=self.rare_class_weights,
-            )
-            out_img_tensors = []
-            out_lbl_tensors = []
-            for img, lbl in zip(images, labels):
-                if self.do_augment:
-                    img, lbl = random_flip_3d(img, lbl, p=0.5)
-                out_img_tensors.append(torch.from_numpy(img).float().unsqueeze(0))
-                out_lbl_tensors.append(torch.from_numpy(lbl).long())
-            
-            image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
-            label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
-        else:
-            # Validation uses deterministic multi-patch sampling for repeatability.
-            images, labels = sample_val_patches_deterministic(
-                image, label, self.patch_size, num_patches=self.num_patches
-            )
-            out_img_tensors = [torch.from_numpy(img).float().unsqueeze(0) for img in images]
-            out_lbl_tensors = [torch.from_numpy(lbl).long() for lbl in labels]
-            image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
-            label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
+        images, labels = sample_patches_option_d(
+            image,
+            label,
+            self.patch_size,
+            num_patches=self.num_patches,
+            rare_class_prob=self.rare_class_prob,
+            rare_class_weights=self.rare_class_weights,
+        )
+        out_img_tensors = []
+        out_lbl_tensors = []
+        for img, lbl in zip(images, labels):
+            if self.do_augment:
+                img, lbl = random_flip_3d(img, lbl, p=0.5)
+            out_img_tensors.append(torch.from_numpy(img).float().unsqueeze(0))
+            out_lbl_tensors.append(torch.from_numpy(lbl).long())
+
+        image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
+        label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
 
         if label_t.min() < 0 or label_t.max() >= self.num_classes:
             raise ValueError(
@@ -373,14 +280,13 @@ def build_train_val_loaders(
     split_ratio: float = 0.8,
     patch_size: tuple[int, int, int] = (128, 128, 128),
     num_patches_per_volume: int = 4,
-    num_val_patches_per_volume: int = 4,
     batch_size: int = 1,
     num_workers: int = 0,
     rare_class_patch_prob: float = 0.35,
     rare_class_weight_max: float = 4.0,
-) -> tuple[CTAPatchDataset, CTAPatchDataset, DataLoader, DataLoader, int]:
+) -> tuple[CTAPatchDataset, list[str], DataLoader, int]:
     """
-    Build CTA train/val datasets and dataloaders.
+    Build CTA train dataset + loader and return validation case IDs.
     Reuses split + preprocessing utilities from data_utils.py.
     """
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -426,7 +332,6 @@ def build_train_val_loaders(
         image_dir=image_dir,
         label_dir=label_dir,
         patch_size=patch_size,
-        mode="train",
         preprocess_fn=None,
         do_augment=True,
         num_classes=num_classes,
@@ -434,32 +339,13 @@ def build_train_val_loaders(
         rare_class_prob=rare_class_patch_prob,
         rare_class_weights=rare_class_weights,
     )
-    val_ds = CTAPatchDataset(
-        case_ids=val_ids,
-        image_dir=image_dir,
-        label_dir=label_dir,
-        patch_size=patch_size,
-        mode="val",
-        preprocess_fn=None,
-        do_augment=False,
-        num_classes=num_classes,
-        num_patches=num_val_patches_per_volume,
-    )
-
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-
-    return train_ds, val_ds, train_loader, val_loader, num_classes
+    return train_ds, val_ids, train_loader, num_classes
 
 
 if __name__ == "__main__":
@@ -467,14 +353,14 @@ if __name__ == "__main__":
     np.random.seed(42)
     torch.manual_seed(42)
 
-    train_ds, val_ds, train_loader, val_loader, num_classes = build_train_val_loaders(
+    train_ds, val_case_ids, train_loader, num_classes = build_train_val_loaders(
         patch_size=(128, 128, 128),
         batch_size=1,
         num_workers=0,
     )
 
     print(f"num_classes={num_classes}")
-    print(f"train cases={len(train_ds)}, val cases={len(val_ds)}")
+    print(f"train cases={len(train_ds)}, val cases={len(val_case_ids)}")
 
     sample_x, sample_y, sample_case = train_ds[0]
     print("\nDataset sample check:")
@@ -490,12 +376,6 @@ if __name__ == "__main__":
     print(f"  image batch shape={tuple(batch_x.shape)}, dtype={batch_x.dtype}")
     print(f"  label batch shape={tuple(batch_y.shape)}, dtype={batch_y.dtype}")
     print(f"  case_ids={list(batch_case_ids)}")
-
-    val_batch_x, val_batch_y, val_batch_case_ids = next(iter(val_loader))
-    print("\nVal loader batch check:")
-    print(f"  image batch shape={tuple(val_batch_x.shape)}, dtype={val_batch_x.dtype}")
-    print(f"  label batch shape={tuple(val_batch_y.shape)}, dtype={val_batch_y.dtype}")
-    print(f"  case_ids={list(val_batch_case_ids)}")
 
     fake_logits = torch.randn(
         batch_x.shape[0] * batch_x.shape[1],

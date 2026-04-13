@@ -21,6 +21,7 @@ from data_loader import (
 )
 from data_utils import read_num_classes_from_labelmap
 from model_3d_unet import UNet3D
+from validation import validate_one_epoch
 
 
 class DiceCELoss(nn.Module):
@@ -68,7 +69,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--patch-size", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--num-patches-per-volume", type=int, default=2)
-    parser.add_argument("--num-val-patches-per-volume", type=int, default=4)
+    parser.add_argument(
+        "--val-stride",
+        type=int,
+        nargs=3,
+        default=None,
+        help=(
+            "Sliding-window stride (x y z) used only for full-volume validation. "
+            "Default is patch_size // 2 per axis."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--base-ch", type=int, default=16)
@@ -204,42 +214,6 @@ def _flatten_loader_batch(
     return x, y
 
 
-def _compute_per_class_dice(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    num_classes: int,
-) -> tuple[list[float], list[int]]:
-    """Per-class Dice using the nnU-Net / MONAI / challenge-leaderboard convention.
-
-    Edge cases (no smoothing epsilon — exact set comparison):
-      * Both empty  → Dice = 1.0  (perfect agreement on absence)
-      * One empty   → Dice = 0.0  (false positive or false negative)
-      * Both present → 2|P∩G| / (|P|+|G|)
-    Every class is always counted as a valid observation.
-    """
-    dice_vals: list[float] = []
-    valid_counts: list[int] = []
-    for c in range(num_classes):
-        pred_c = pred == c
-        tgt_c = target == c
-        pred_count = pred_c.sum().item()
-        tgt_count = tgt_c.sum().item()
-        if pred_count == 0 and tgt_count == 0:
-            dice_vals.append(1.0)
-            valid_counts.append(1)
-            continue
-        denom = pred_count + tgt_count
-        if denom == 0:
-            dice_vals.append(1.0)
-            valid_counts.append(1)
-            continue
-        inter = (pred_c & tgt_c).sum().item()
-        dice = (2.0 * inter) / denom
-        dice_vals.append(float(dice))
-        valid_counts.append(1)
-    return dice_vals, valid_counts
-
-
 def train_one_epoch(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -266,75 +240,6 @@ def train_one_epoch(
     return running_loss / max(n_steps, 1)
 
 
-def validate_one_epoch(
-    model: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    num_classes: int,
-) -> tuple[float, float, float, list[float]]:
-    model.eval()
-    running_loss = 0.0
-    n_steps = 0
-
-    per_class_sum = [0.0] * num_classes
-    per_class_count = [0] * num_classes
-    per_class_gt_present_count = [0] * num_classes
-
-    with torch.no_grad():
-        for batch_x, batch_y, _ in loader:
-            batch_x, batch_y = _flatten_loader_batch(batch_x, batch_y)
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-
-            logits = model(batch_x)
-            loss = criterion(logits, batch_y)
-            running_loss += float(loss.item())
-            n_steps += 1
-
-            pred = torch.argmax(logits, dim=1)
-            dice_vals, valid_counts = _compute_per_class_dice(
-                pred=pred, target=batch_y, num_classes=num_classes
-            )
-            for c in range(num_classes):
-                if valid_counts[c]:
-                    per_class_sum[c] += dice_vals[c]
-                    per_class_count[c] += 1
-                # Track whether class c appears in GT for this validation batch.
-                # This supports a present-only mean Dice that ignores empty GT classes.
-                if (batch_y == c).any().item():
-                    per_class_gt_present_count[c] += 1
-
-    avg_loss = running_loss / max(n_steps, 1)
-    per_class_dice = [
-        (per_class_sum[c] / per_class_count[c]) if per_class_count[c] > 0 else 0.0
-        for c in range(num_classes)
-    ]
-
-    # Mean foreground Dice over all foreground classes.
-    # With the empty-empty=1 convention, absent classes can inflate this value.
-    fg_scores_all = [
-        per_class_dice[c]
-        for c in range(1, num_classes)
-        if per_class_count[c] > 0
-    ]
-    mean_fg_dice_all = float(sum(fg_scores_all) / max(len(fg_scores_all), 1))
-
-    # Present-only foreground mean Dice: includes class c only if GT contains c
-    # in at least one validation batch this epoch. This is more robust when many
-    # classes are anatomically absent for a given split.
-    fg_scores_present_only = [
-        per_class_dice[c]
-        for c in range(1, num_classes)
-        if per_class_gt_present_count[c] > 0
-    ]
-    mean_fg_dice_present_only = float(
-        sum(fg_scores_present_only) / max(len(fg_scores_present_only), 1)
-    )
-
-    return avg_loss, mean_fg_dice_present_only, mean_fg_dice_all, per_class_dice
-
-
 def _build_overfit_loaders(
     *,
     case_id: str,
@@ -342,11 +247,10 @@ def _build_overfit_loaders(
     batch_size: int,
     num_workers: int,
     num_patches_per_volume: int,
-    num_val_patches_per_volume: int,
     disable_augment: bool,
     rare_class_patch_prob: float,
     rare_class_weight_max: float,
-) -> tuple[DataLoader, DataLoader, int]:
+) -> tuple[DataLoader, int]:
     image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
     label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
     labelmap_path = Path("training_data_resampled/itksnap_labelmap_txt/labelmap_topbrain_ct.txt")
@@ -371,7 +275,6 @@ def _build_overfit_loaders(
         image_dir=image_dir,
         label_dir=label_dir,
         patch_size=patch_size,
-        mode="train",
         preprocess_fn=None,
         do_augment=not disable_augment,
         num_classes=num_classes,
@@ -379,30 +282,13 @@ def _build_overfit_loaders(
         rare_class_prob=rare_class_patch_prob,
         rare_class_weights=rare_class_weights,
     )
-    val_ds = CTAPatchDataset(
-        case_ids=[case_id],
-        image_dir=image_dir,
-        label_dir=label_dir,
-        patch_size=patch_size,
-        mode="val",
-        preprocess_fn=None,
-        do_augment=False,
-        num_classes=num_classes,
-        num_patches=num_val_patches_per_volume,
-    )
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-    return train_loader, val_loader, num_classes
+    return train_loader, num_classes
 
 
 def main() -> int:
@@ -416,31 +302,36 @@ def main() -> int:
     metrics_csv = out_dir / "metrics.csv"
 
     patch_size = tuple(int(x) for x in args.patch_size)
+    val_stride = (
+        tuple(max(int(s), 1) for s in args.val_stride)
+        if args.val_stride is not None
+        else tuple(max(p // 2, 1) for p in patch_size)
+    )
     label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
+    image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
 
     if args.overfit_case_id:
-        train_loader, val_loader, num_classes = _build_overfit_loaders(
+        train_loader, num_classes = _build_overfit_loaders(
             case_id=args.overfit_case_id,
             patch_size=patch_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             num_patches_per_volume=args.num_patches_per_volume,
-            num_val_patches_per_volume=args.num_val_patches_per_volume,
             disable_augment=args.overfit_disable_augment,
             rare_class_patch_prob=args.rare_class_patch_prob,
             rare_class_weight_max=args.rare_class_weight_max,
         )
         train_case_ids = [args.overfit_case_id]
+        val_case_ids = [args.overfit_case_id]
         print(
             "overfit mode enabled: "
             f"case_id={args.overfit_case_id} "
             f"augment={'off' if args.overfit_disable_augment else 'on'}"
         )
     else:
-        train_ds, _, train_loader, val_loader, num_classes = build_train_val_loaders(
+        train_ds, val_case_ids, train_loader, num_classes = build_train_val_loaders(
             patch_size=patch_size,
             num_patches_per_volume=args.num_patches_per_volume,
-            num_val_patches_per_volume=args.num_val_patches_per_volume,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             rare_class_patch_prob=args.rare_class_patch_prob,
@@ -449,7 +340,7 @@ def main() -> int:
         train_case_ids = train_ds.case_ids
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
-        f"train_batches={len(train_loader)} val_batches={len(val_loader)}"
+        f"val_stride={val_stride} train_batches={len(train_loader)} val_cases={len(val_case_ids)}"
     )
     print(
         "rare-class sampling: "
@@ -492,7 +383,6 @@ def main() -> int:
                 "train_loss",
                 "val_loss",
                 "val_mean_fg_dice",
-                "val_mean_fg_dice_all",
                 *[f"val_dice_c{c:02d}" for c in range(num_classes)],
             ]
         )
@@ -509,9 +399,13 @@ def main() -> int:
             optimizer=optimizer,
             device=device,
         )
-        val_loss, val_mean_fg_dice, val_mean_fg_dice_all, per_class_dice = validate_one_epoch(
+        val_loss, val_mean_fg_dice, per_class_dice = validate_one_epoch(
             model=model,
-            loader=val_loader,
+            val_case_ids=val_case_ids,
+            image_dir=image_dir,
+            label_dir=label_dir,
+            patch_size=patch_size,
+            stride=val_stride,
             criterion=criterion,
             device=device,
             num_classes=num_classes,
@@ -529,7 +423,6 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     f"{val_mean_fg_dice:.6f}",
-                    f"{val_mean_fg_dice_all:.6f}",
                     *[f"{d:.6f}" for d in per_class_dice],
                 ]
             )
@@ -542,7 +435,6 @@ def main() -> int:
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
             f"lr={lr:.2e} train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f} "
-            f"val_mean_fg_dice_all={val_mean_fg_dice_all:.6f} "
             f"time={elapsed:.1f}s"
         )
         print(
@@ -551,7 +443,7 @@ def main() -> int:
         )
 
     torch.save(model.state_dict(), final_weights_path)
-    print(f"\nTraining complete. Best val_mean_fg_dice(present_only)={best_val_dice:.6f}")
+    print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
     print(f"Saved metrics: {metrics_csv}")
     print(f"Saved final weights: {final_weights_path}")
     return 0

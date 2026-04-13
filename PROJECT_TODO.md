@@ -242,6 +242,51 @@ below are ordered roughly from easiest to hardest to implement.
 - Evaluate deep supervision.
 - Evaluate boundary-aware auxiliary loss.
 
+## Future Improvements (from TopBrain Lessons)
+
+Source: [TopBrain Tutorials — Lessons from TopCoW](https://topbrain2025.grand-challenge.org/tutorials/#:~:text=Benefits%20of%20mixed,architecture%20%5BLink%5D)
+
+### M) Mixed modality training for CTA
+
+- Train with **both MRA and CTA** modalities together rather than CTA alone.
+  - Top-performing teams in TopCoW found mixed-modality training improved CTA performance specifically.
+  - Build a combined dataloader that samples from both MRA and CTA training sets.
+  - Consider modality conditioning (e.g. a one-hot modality token or separate input channel) so the
+    model can distinguish the two input domains.
+  - Evaluate CTA-only vs mixed-modality models on the CTA validation leaderboard to confirm the gain.
+
+### N) Topological loss functions (centerline-based)
+
+Thin vessels fail primarily because standard Dice is insensitive to connectivity and centerline
+accuracy. Centerline-aware losses directly penalize topology errors:
+
+- **clDice (centerline Dice)**: computes Dice on the skeletonised prediction and GT, rewarding
+  topologically correct thin-tube predictions. Well-suited for vessels where connectivity matters
+  more than volumetric overlap. [[paper]](https://arxiv.org/abs/2003.07311)
+- **CAS (connectivity-aware surrogate) loss**: a differentiable surrogate for topological
+  connectivity, penalising breaks in predicted vessel paths.
+  [[paper]](https://arxiv.org/abs/2206.07486)
+- **SkelRecall loss**: optimises recall on the skeleton voxels so the predicted vessel covers the
+  full length of the GT centreline, reducing missed vessel segments.
+  [[paper]](https://arxiv.org/abs/2404.03010)
+- **cbDice (centerline boundary Dice)**: extends clDice with boundary-sensitive weighting,
+  combining topological correctness with surface accuracy.
+  [[paper]](https://arxiv.org/abs/2412.12120)
+
+Implementation note: all of these can be added as auxiliary loss terms on top of the existing
+Dice + CE combination (e.g. `total_loss = dice + ce + λ_topo * topo_loss`). Start with clDice
+as it has the most readily available open-source implementations.
+
+### O) Connectivity-based architectural optimizations
+
+- **Lung-airway-style connectivity module**: originally designed for airway tree segmentation,
+  enforces long-range connectivity between predicted vessel segments. Adapt the approach for
+  cerebrovascular trees. [[paper]](https://arxiv.org/abs/2209.01084)
+- **NexToU architecture (neighborhood relation)**: incorporates explicit neighborhood-relation
+  modeling so the network understands spatial adjacency between vessel branches, which helps
+  correctly label branching points and avoid topological errors.
+  [[paper]](https://arxiv.org/abs/2305.15911)
+
 ## Final Deliverables
 
 - Prepare a stable baseline result.

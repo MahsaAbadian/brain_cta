@@ -88,7 +88,7 @@ def test_data_loader_shapes_and_label_bounds() -> None:
     if not DATA_ROOT.exists():
         pytest.skip("Resampled data root not found.")
 
-    train_ds, val_ds, train_loader, val_loader, num_classes = build_train_val_loaders(
+    train_ds, val_case_ids, train_loader, num_classes = build_train_val_loaders(
         patch_size=(96, 96, 96),
         num_patches_per_volume=4,
         batch_size=1,
@@ -97,7 +97,7 @@ def test_data_loader_shapes_and_label_bounds() -> None:
 
     assert num_classes == 41
     assert len(train_ds) > 0
-    assert len(val_ds) > 0
+    assert len(val_case_ids) > 0
 
     sample_x, sample_y, _ = train_ds[0]
     assert tuple(sample_x.shape) == (4, 1, 96, 96, 96)
@@ -110,7 +110,3 @@ def test_data_loader_shapes_and_label_bounds() -> None:
     batch_x, batch_y, _ = next(iter(train_loader))
     assert tuple(batch_x.shape) == (1, 4, 1, 96, 96, 96)
     assert tuple(batch_y.shape) == (1, 4, 96, 96, 96)
-
-    val_x, val_y, _ = next(iter(val_loader))
-    assert tuple(val_x.shape) == (1, 4, 1, 96, 96, 96)
-    assert tuple(val_y.shape) == (1, 4, 96, 96, 96)
