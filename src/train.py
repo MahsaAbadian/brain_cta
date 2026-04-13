@@ -14,7 +14,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from data_loader import CTAPatchDataset, build_train_val_loaders
+from data_loader import (
+    CTAPatchDataset,
+    build_train_val_loaders,
+    compute_rare_class_sampling_weights,
+)
 from data_utils import read_num_classes_from_labelmap
 from model_3d_unet import UNet3D
 
@@ -67,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-val-patches-per-volume", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--base-ch", type=int, default=32)
+    parser.add_argument("--base-ch", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))
@@ -111,6 +115,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional maximum clamp for CE class weights after normalization.",
+    )
+    parser.add_argument(
+        "--rare-class-patch-prob",
+        type=float,
+        default=0.35,
+        help=(
+            "Probability that a train patch center is sampled from a rare foreground "
+            "class (based on patient-level class presence). Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--rare-class-weight-max",
+        type=float,
+        default=4.0,
+        help=(
+            "Maximum patient-presence inverse weight used for rare-class patch "
+            "sampling. Higher increases focus on sparse classes."
+        ),
     )
     return parser.parse_args()
 
@@ -344,6 +366,8 @@ def _build_overfit_loaders(
     num_patches_per_volume: int,
     num_val_patches_per_volume: int,
     disable_augment: bool,
+    rare_class_patch_prob: float,
+    rare_class_weight_max: float,
 ) -> tuple[DataLoader, DataLoader, int]:
     image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
     label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
@@ -358,6 +382,12 @@ def _build_overfit_loaders(
         )
 
     num_classes = read_num_classes_from_labelmap(labelmap_path)
+    rare_class_weights = compute_rare_class_sampling_weights(
+        label_dir=label_dir,
+        case_ids=[case_id],
+        num_classes=num_classes,
+        max_weight=rare_class_weight_max,
+    )
     train_ds = CTAPatchDataset(
         case_ids=[case_id],
         image_dir=image_dir,
@@ -368,6 +398,8 @@ def _build_overfit_loaders(
         do_augment=not disable_augment,
         num_classes=num_classes,
         num_patches=num_patches_per_volume,
+        rare_class_prob=rare_class_patch_prob,
+        rare_class_weights=rare_class_weights,
     )
     val_ds = CTAPatchDataset(
         case_ids=[case_id],
@@ -417,6 +449,8 @@ def main() -> int:
             num_patches_per_volume=args.num_patches_per_volume,
             num_val_patches_per_volume=args.num_val_patches_per_volume,
             disable_augment=args.overfit_disable_augment,
+            rare_class_patch_prob=args.rare_class_patch_prob,
+            rare_class_weight_max=args.rare_class_weight_max,
         )
         train_case_ids = [args.overfit_case_id]
         print(
@@ -431,11 +465,18 @@ def main() -> int:
             num_val_patches_per_volume=args.num_val_patches_per_volume,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            rare_class_patch_prob=args.rare_class_patch_prob,
+            rare_class_weight_max=args.rare_class_weight_max,
         )
         train_case_ids = train_ds.case_ids
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
         f"train_batches={len(train_loader)} val_batches={len(val_loader)}"
+    )
+    print(
+        "rare-class sampling: "
+        f"prob={args.rare_class_patch_prob:.2f} "
+        f"max_weight={args.rare_class_weight_max:.2f}"
     )
 
     ce_weights = compute_class_weights(

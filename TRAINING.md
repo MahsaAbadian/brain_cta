@@ -181,7 +181,7 @@ This can inflate means when many classes are absent.
 - `--num-val-patches-per-volume` (default: `4`): deterministic validation patches sampled per volume.
 - `--lr` (default: `2e-4`): AdamW learning rate.
 - `--weight-decay` (default: `1e-5`): AdamW weight decay.
-- `--base-ch` (default: `32`): base channels of U-Net.
+- `--base-ch` (default: `16`): base channels of U-Net.
 - `--seed` (default: `42`): random seed for Python, NumPy, and PyTorch.
 - `--save-every` (default: `1`): save epoch checkpoint every N epochs (`<=0` disables periodic epoch checkpoints).
 - `--out-dir` (default: `runs/baseline`): output directory for metrics and checkpoints.
@@ -191,6 +191,8 @@ This can inflate means when many classes are absent.
 - `--ce-weight` (default: `1.0`): CE term weight in total loss.
 - `--ce-weight-min` (default: none): minimum clamp for class weights.
 - `--ce-weight-max` (default: none): maximum clamp for class weights.
+- `--rare-class-patch-prob` (default: `0.35`): probability of sampling train patch centers from rare present classes.
+- `--rare-class-weight-max` (default: `4.0`): cap for patient-presence inverse weights used by rare-class sampling.
 
 ## Scheduler and Optimizer
 

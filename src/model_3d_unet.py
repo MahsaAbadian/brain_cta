@@ -28,10 +28,10 @@ class ConvBlock3D(nn.Module):
 class UNet3D(nn.Module):
     """
     3D U-Net for multiclass vessel segmentation.
-    Default channels: 32 -> 64 -> 128 -> 256 -> 512 (bottleneck).
+    Default channels: 16 -> 32 -> 64 -> 128 -> 256 (bottleneck).
     Uses InstanceNorm + LeakyReLU (stable with batch_size=1).
     """
-    def __init__(self, in_channels: int = 1, num_classes: int = 41, base_ch: int = 32):
+    def __init__(self, in_channels: int = 1, num_classes: int = 41, base_ch: int = 16):
         super().__init__()
 
         # Encoder
@@ -108,7 +108,7 @@ class UNet3D(nn.Module):
 
 if __name__ == "__main__":
     # quick shape sanity test
-    model = UNet3D(in_channels=1, num_classes=41, base_ch=32)
+    model = UNet3D(in_channels=1, num_classes=41, base_ch=16)
     x = torch.randn(2, 1, 96, 96, 96)  # (B, C, D, H, W)
     y = model(x)
     print("input :", x.shape)
