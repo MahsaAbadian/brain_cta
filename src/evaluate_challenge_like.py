@@ -29,7 +29,11 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Path to model checkpoint (e.g., runs/.../checkpoint_best.pt).",
+        help=(
+            "Path to model weights. Supports either a raw state_dict file "
+            "(e.g., runs/.../model_final_weights.pt) or a checkpoint dict "
+            "with a model_state key."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -65,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         "--patch-size",
         type=int,
         nargs=3,
-        default=(96, 96, 96),
+        default=(128, 128, 128),
         help="Sliding-window patch size (x y z).",
     )
     parser.add_argument(
@@ -201,8 +205,13 @@ def main() -> int:
     num_classes = read_num_classes_from_labelmap(args.labelmap_path)
     model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+    weights_obj = torch.load(args.checkpoint, map_location=device)
+    state_dict = (
+        weights_obj["model_state"]
+        if isinstance(weights_obj, dict) and "model_state" in weights_obj
+        else weights_obj
+    )
+    model.load_state_dict(state_dict)
     model.eval()
 
     patch_size = tuple(int(v) for v in args.patch_size)

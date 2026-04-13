@@ -206,8 +206,6 @@ After running `src/preprocess_resample.py`, the next step is to inspect the save
 - From project root:
   - `.venv/bin/python src/train.py`
   - `.venv/bin/python src/train.py --epochs 40 --out-dir runs/baseline_e40`
-  - `.venv/bin/python src/train_sanity_check.py` (quick pipeline smoke test)
-
 ### Notes
 - Builds CTA train/val loaders from `training_data_resampled/`.
 - Uses `UNet3D` + `DiceCELoss` objective.

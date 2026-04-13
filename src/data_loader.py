@@ -273,7 +273,7 @@ class CTAPatchDataset(Dataset):
         case_ids: Sequence[str],
         image_dir: Path,
         label_dir: Path,
-        patch_size: tuple[int, int, int] = (96, 96, 96),
+        patch_size: tuple[int, int, int] = (128, 128, 128),
         mode: str = "train",
         preprocess_fn: Callable[[np.ndarray], np.ndarray] | None = None,
         do_augment: bool = True,
@@ -371,7 +371,7 @@ def build_train_val_loaders(
     label_dir: Path = Path("training_data_resampled/labelsTr_topbrain_ct"),
     labelmap_path: Path = Path("training_data_resampled/itksnap_labelmap_txt/labelmap_topbrain_ct.txt"),
     split_ratio: float = 0.8,
-    patch_size: tuple[int, int, int] = (96, 96, 96),
+    patch_size: tuple[int, int, int] = (128, 128, 128),
     num_patches_per_volume: int = 4,
     num_val_patches_per_volume: int = 4,
     batch_size: int = 1,
@@ -468,7 +468,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
 
     train_ds, val_ds, train_loader, val_loader, num_classes = build_train_val_loaders(
-        patch_size=(96, 96, 96),
+        patch_size=(128, 128, 128),
         batch_size=1,
         num_workers=0,
     )

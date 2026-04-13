@@ -109,7 +109,7 @@ class UNet3D(nn.Module):
 if __name__ == "__main__":
     # quick shape sanity test
     model = UNet3D(in_channels=1, num_classes=41, base_ch=16)
-    x = torch.randn(2, 1, 96, 96, 96)  # (B, C, D, H, W)
+    x = torch.randn(2, 1, 128, 128, 128)  # (B, C, D, H, W)
     y = model(x)
     print("input :", x.shape)
-    print("output:", y.shape)  # expected: (2, 41, 96, 96, 96)
+    print("output:", y.shape)  # expected: (2, 41, 128, 128, 128)

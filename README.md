@@ -18,7 +18,6 @@ The current goal is to build and compare a 3D U-Net baseline for TopBrain vessel
 - `src/data_utils.py`: helper functions for preprocessing, split handling, cropping, spacing, and label utilities.
 - `src/model_3d_unet.py`: 3D U-Net model definition.
 - `src/train.py`: full baseline training script (epochs, validation, checkpoints, metrics).
-- `src/train_sanity_check.py`: tiny pipeline sanity-check run for quick debugging.
 - `src/inspect_data.py`: script for visualizing scans, labels, overlays, and spacing information.
 - `training_data/README.txt`: dataset description from the TopBrain release.
 - `training_data/License.txt`: dataset license information from the TopBrain release.
@@ -85,12 +84,6 @@ The current loader defaults point to the resampled CTA folders, so after preproc
 
 `train.py` now runs a full baseline loop with validation, checkpoint saving, and metric logging.
 Detailed training behavior and argument reference: `TRAINING.md`.
-
-For a quick pipeline smoke check, run:
-
-```bash
-.venv/bin/python src/train_sanity_check.py
-```
 
 ## Run Tests
 

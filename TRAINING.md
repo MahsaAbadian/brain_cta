@@ -5,10 +5,7 @@ This document explains how training works in this repository, including loss def
 ## Entry Points
 
 - Full training: `src/train.py`
-- Quick smoke test: `src/train_sanity_check.py`
 - Challenge-like local evaluation: `src/evaluate_challenge_like.py`
-
-Use full training for real experiments and use sanity check only for fast pipeline debugging.
 
 ## Data Assumptions
 
@@ -33,10 +30,10 @@ Run a baseline experiment:
 .venv/bin/python src/train.py --epochs 10 --out-dir runs/baseline_exp1
 ```
 
-Run the tiny sanity check:
+If you hit GPU OOM with the default 128³ patches, reduce patches per volume first:
 
 ```bash
-.venv/bin/python src/train_sanity_check.py
+.venv/bin/python src/train.py --epochs 10 --num-patches-per-volume 1 --out-dir runs/baseline_exp1
 ```
 
 ## Training Loop Overview
@@ -176,7 +173,9 @@ This can inflate means when many classes are absent.
 - `--epochs` (default: `40`): number of training epochs.
 - `--batch-size` (default: `1`): number of volumes per loader batch.
 - `--num-workers` (default: `0`): dataloader worker processes.
-- `--patch-size` (default: `96 96 96`): patch size tuple in code order `(x, y, z)`.
+- `--patch-size` (default: `128 128 128`): patch size tuple in code order `(x, y, z)`.
+  128³ gives ~2.4× more context than 96³ and is important for thin vessel disambiguation.
+  If you hit OOM, reduce `--num-patches-per-volume` to `1` before reducing patch size.
 - `--num-patches-per-volume` (default: `2`): training patches sampled per volume.
 - `--num-val-patches-per-volume` (default: `4`): deterministic validation patches sampled per volume.
 - `--lr` (default: `2e-4`): AdamW learning rate.
@@ -228,9 +227,9 @@ your validation split and export NIfTI predictions.
 
 ```bash
 .venv/bin/python src/evaluate_challenge_like.py \
-  --checkpoint runs/exp_ps96_np4_ce05_clamp2/checkpoint_best.pt \
+  --checkpoint runs/exp_ps128_np2_ce05_clamp2/checkpoint_best.pt \
   --out-dir runs/challenge_like_eval_exp1 \
-  --patch-size 96 96 96 \
+  --patch-size 128 128 128 \
   --stride 64 64 64
 ```
 
@@ -249,7 +248,7 @@ This creates:
 
 ```bash
 .venv/bin/python src/evaluate_challenge_like.py \
-  --checkpoint runs/exp_ps96_np4_ce05_clamp2/checkpoint_best.pt \
+  --checkpoint runs/exp_ps128_np2_ce05_clamp2/checkpoint_best.pt \
   --out-dir runs/challenge_like_eval_exp1 \
   --run-topbrain-eval \
   --topbrain-track cta
@@ -281,14 +280,17 @@ Use a unique output folder per experiment:
 .venv/bin/python src/train.py \
   --epochs 200 \
   --lr 3e-4 \
-  --patch-size 96 96 96 \
-  --num-patches-per-volume 4 \
+  --patch-size 128 128 128 \
+  --num-patches-per-volume 2 \
   --num-val-patches-per-volume 4 \
   --ce-weight 0.5 \
   --dice-weight 1.0 \
   --ce-weight-max 2.0 \
-  --out-dir runs/exp_ps96_np4_ce05_clamp2
+  --out-dir runs/exp_ps128_np2_ce05_clamp2
 ```
+
+Note: `--num-patches-per-volume` is reduced from 4 to 2 compared to 96³ experiments to
+compensate for the ~2.4× higher memory cost of 128³ patches. If still OOM, drop to 1.
 
 This avoids overwriting previous metrics and provides stable rare-class behavior.
 

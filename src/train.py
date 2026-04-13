@@ -1,4 +1,4 @@
-"""Full baseline training script with validation, checkpoints, and metric logging."""
+"""Full baseline training script with validation and metric logging."""
 
 from __future__ import annotations
 
@@ -66,14 +66,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--patch-size", type=int, nargs=3, default=(96, 96, 96))
+    parser.add_argument("--patch-size", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--num-patches-per-volume", type=int, default=2)
     parser.add_argument("--num-val-patches-per-volume", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--base-ch", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))
     parser.add_argument(
         "--overfit-case-id",
@@ -336,27 +335,6 @@ def validate_one_epoch(
     return avg_loss, mean_fg_dice_present_only, mean_fg_dice_all, per_class_dice
 
 
-def _save_checkpoint(
-    path: Path,
-    epoch: int,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    best_val_dice: float,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "best_val_dice": best_val_dice,
-        },
-        path,
-    )
-
-
 def _build_overfit_loaders(
     *,
     case_id: str,
@@ -520,8 +498,7 @@ def main() -> int:
         )
 
     best_val_dice = -1.0
-    best_path = out_dir / "checkpoint_best.pt"
-    latest_path = out_dir / "checkpoint_latest.pt"
+    final_weights_path = out_dir / "model_final_weights.pt"
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -557,33 +534,8 @@ def main() -> int:
                 ]
             )
 
-        _save_checkpoint(
-            path=latest_path,
-            epoch=epoch,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            best_val_dice=best_val_dice,
-        )
-        if args.save_every > 0 and (epoch % args.save_every == 0):
-            _save_checkpoint(
-                path=out_dir / f"checkpoint_epoch_{epoch:03d}.pt",
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                best_val_dice=best_val_dice,
-            )
         if val_mean_fg_dice > best_val_dice:
             best_val_dice = val_mean_fg_dice
-            _save_checkpoint(
-                path=best_path,
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                best_val_dice=best_val_dice,
-            )
 
         elapsed = time.time() - epoch_start
         print(
@@ -598,9 +550,10 @@ def main() -> int:
             + ", ".join(f"c{idx:02d}={d:.4f}" for idx, d in enumerate(per_class_dice))
         )
 
+    torch.save(model.state_dict(), final_weights_path)
     print(f"\nTraining complete. Best val_mean_fg_dice(present_only)={best_val_dice:.6f}")
     print(f"Saved metrics: {metrics_csv}")
-    print(f"Saved checkpoints: {latest_path}, {best_path}")
+    print(f"Saved final weights: {final_weights_path}")
     return 0
 
 
