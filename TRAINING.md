@@ -42,7 +42,7 @@ If you hit GPU OOM with the default 128³ patches, reduce patches per volume fir
 
 1. Build train/val loaders from resampled CTA data.
 2. Create `UNet3D` (`src/model_3d_unet.py`).
-3. Build weighted CE + soft Dice loss (`DiceCELoss`).
+3. Build CE + soft Dice loss (`DiceCELoss`), with optional CE class weighting.
 4. Train one epoch (`train_one_epoch`).
 5. Validate one epoch (`validate_one_epoch`).
 6. Log metrics to CSV (including per-class Dice).
@@ -79,7 +79,7 @@ For each voxel with true class `y` and logits `z_c`:
 - `p_c = softmax(z)_c`
 - `CE_voxel = -log(p_y)`
 
-With class weighting:
+When CE class weighting is enabled:
 
 - `CE_voxel_weighted = w_y * (-log(p_y))`
 
@@ -124,17 +124,22 @@ Dice loss is:
 
 - `--ce-weight`: scales CE term
 - `--dice-weight`: scales Dice term
-- `--ce-weight-min`, `--ce-weight-max`: clamp class weights
+- `--cldice-weight`: scales clDice term (`0` disables clDice)
+- `--cldice-iters`: soft-skeletonization iterations used by clDice
+- `--enable-ce-class-weights`: enables inverse-sqrt CE class weights
+- `--ce-weight-min`, `--ce-weight-max`: clamp class weights (only used when CE class weights are enabled)
 
 Current default behavior in `src/train.py`:
 
 - `ce_weight = 1.0`
 - `dice_weight = 1.0`
+- `cldice_weight = 1.0` (clDice enabled by default)
 - `include_background = False` (Dice term ignores class `0`)
-- CE uses computed class weights from training labels
+- CE class weighting is disabled by default (unweighted CE unless `--enable-ce-class-weights` is set)
 
 Useful tuning pattern for imbalanced classes:
 
+- enable CE class weighting (`--enable-ce-class-weights`)
 - reduce CE emphasis (`--ce-weight 0.3` to `0.5`)
 - cap rare-class boost (`--ce-weight-max 1.5` to `2.0`)
 
@@ -155,13 +160,13 @@ This can inflate means when many classes are absent.
 
 `validate_one_epoch` logs two foreground summaries:
 
-1. `val_mean_fg_dice` (present-only, primary)
-   - mean over foreground classes `1..C-1` where GT appears at least once in validation batches during that epoch
+1. `val_mean_fg_dice` (primary)
+   - mean over foreground classes `1..C-1`, but skips classes that are absent in both prediction and GT over the full validation epoch
    - best-checkpoint selection uses this metric
 
-2. `val_mean_fg_dice_all` (empty-aware, secondary)
-   - mean over all foreground classes regardless of GT presence
-   - useful diagnostic, but can be inflated by absent classes
+2. `val_mean_fg_dice_all_cases_present` (strict cohort-presence mean)
+   - mean over foreground classes that are present in the GT of every validation case
+   - useful when you want to score only consistently present vessels across the whole validation cohort
 
 ### Per-class logging
 
@@ -188,8 +193,11 @@ This can inflate means when many classes are absent.
 - `--overfit-disable-augment` (default: off): in overfit mode, disable random training flips.
 - `--dice-weight` (default: `1.0`): Dice term weight in total loss.
 - `--ce-weight` (default: `1.0`): CE term weight in total loss.
-- `--ce-weight-min` (default: none): minimum clamp for class weights.
-- `--ce-weight-max` (default: none): maximum clamp for class weights.
+- `--cldice-weight` (default: `1.0`): clDice term weight in total loss.
+- `--cldice-iters` (default: `3`): number of iterative soft-skeletonization steps for clDice.
+- `--enable-ce-class-weights` (default: off): enables inverse-sqrt CE class weighting.
+- `--ce-weight-min` (default: none): minimum clamp for class weights (only when enabled).
+- `--ce-weight-max` (default: none): maximum clamp for class weights (only when enabled).
 - `--rare-class-patch-prob` (default: `0.35`): probability of sampling train patch centers from rare present classes.
 - `--rare-class-weight-max` (default: `4.0`): cap for patient-presence inverse weights used by rare-class sampling.
 
@@ -208,8 +216,8 @@ Inside `--out-dir`:
   - `lr`
   - `train_loss`
   - `val_loss`
-  - `val_mean_fg_dice` (present-only)
-  - `val_mean_fg_dice_all` (empty-aware)
+  - `val_mean_fg_dice`
+  - `val_mean_fg_dice_all_cases_present`
   - `val_dice_c00` ... `val_dice_cXX`
 - `checkpoint_latest.pt`: overwritten each epoch.
 - `checkpoint_best.pt`: updated when `val_mean_fg_dice` improves.
@@ -315,4 +323,4 @@ Expected behavior: train loss drops quickly and `val_mean_fg_dice` rises much hi
 - If training is very slow on CPU, reduce `--patch-size` and `--num-patches-per-volume` for debugging.
 - If OOM on GPU, reduce patch size and/or number of patches per volume.
 - If `num_classes` mismatch appears, check label map under `training_data_resampled/itksnap_labelmap_txt`.
-- If `val_mean_fg_dice_all` is high but `val_mean_fg_dice` is low, you are likely seeing empty-class inflation from absent labels.
+- If `val_mean_fg_dice_all_cases_present` is `NaN`, no foreground class is present in every validation case.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import nibabel as nib
 import numpy as np
@@ -56,7 +57,8 @@ def validate_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     num_classes: int,
-) -> tuple[float, float, list[float]]:
+    topbrain_case_callback: Callable[[str, np.ndarray, Path], None] | None = None,
+) -> tuple[float, float, float, list[float]]:
     """Run one epoch of full-volume sliding-window validation."""
     model.eval()
     running_loss = 0.0
@@ -64,6 +66,8 @@ def validate_one_epoch(
 
     per_class_sum = [0.0] * num_classes
     per_class_count = [0] * num_classes
+    gt_presence_count = [0] * num_classes
+    pred_or_gt_presence_any = [False] * num_classes
 
     with torch.no_grad():
         for case_id in val_case_ids:
@@ -114,9 +118,21 @@ def validate_one_epoch(
             counts = np.maximum(counts, 1.0)
             avg_logits = logits_sum / counts[None, ...]
             pred_np = np.argmax(avg_logits, axis=0).astype(np.int64)
+            if topbrain_case_callback is not None:
+                topbrain_case_callback(case_id, pred_np, label_path)
 
             pred = torch.from_numpy(pred_np)
             target = torch.from_numpy(target_np)
+            pred_or_gt_present_classes = set(np.unique(pred_np).tolist()) | set(
+                np.unique(target_np).tolist()
+            )
+            for c in pred_or_gt_present_classes:
+                if 0 <= int(c) < num_classes:
+                    pred_or_gt_presence_any[int(c)] = True
+            present_classes = np.unique(target_np)
+            for c in present_classes:
+                if 0 <= int(c) < num_classes:
+                    gt_presence_count[int(c)] += 1
             dice_vals, valid_counts = _compute_per_class_dice(
                 pred=pred, target=target, num_classes=num_classes
             )
@@ -130,6 +146,20 @@ def validate_one_epoch(
         (per_class_sum[c] / per_class_count[c]) if per_class_count[c] > 0 else 0.0
         for c in range(num_classes)
     ]
-    fg_scores = [per_class_dice[c] for c in range(1, num_classes) if per_class_count[c] > 0]
+    fg_scores = [
+        per_class_dice[c]
+        for c in range(1, num_classes)
+        if per_class_count[c] > 0 and pred_or_gt_presence_any[c]
+    ]
     mean_fg_dice = float(sum(fg_scores) / max(len(fg_scores), 1))
-    return avg_loss, mean_fg_dice, per_class_dice
+    fg_all_cases_scores = [
+        per_class_dice[c]
+        for c in range(1, num_classes)
+        if len(val_case_ids) > 0 and gt_presence_count[c] == len(val_case_ids)
+    ]
+    mean_fg_dice_all_cases_present = (
+        float(sum(fg_all_cases_scores) / len(fg_all_cases_scores))
+        if fg_all_cases_scores
+        else float("nan")
+    )
+    return avg_loss, mean_fg_dice, mean_fg_dice_all_cases_present, per_class_dice

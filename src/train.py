@@ -21,6 +21,13 @@ from data_loader import (
 )
 from data_utils import read_num_classes_from_labelmap
 from model_3d_unet import UNet3D
+from topbrain_validation import (
+    TOPBRAIN_METRIC_KEYS,
+    TopBrainRuntime,
+    empty_topbrain_metrics,
+    select_fixed_topbrain_subset,
+    should_run_topbrain_full_eval,
+)
 from validation import validate_one_epoch
 
 
@@ -30,6 +37,8 @@ class DiceCELoss(nn.Module):
         num_classes: int,
         dice_weight: float = 1.0,
         ce_weight: float = 1.0,
+        cldice_weight: float = 0.0,
+        cldice_iters: int = 3,
         include_background: bool = True,
         eps: float = 1e-6,
         ce_class_weights: torch.Tensor | None = None,
@@ -38,9 +47,46 @@ class DiceCELoss(nn.Module):
         self.num_classes = num_classes
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
+        self.cldice_weight = cldice_weight
+        self.cldice_iters = cldice_iters
         self.include_background = include_background
         self.eps = eps
         self.ce = nn.CrossEntropyLoss(weight=ce_class_weights)
+
+    @staticmethod
+    def _soft_erode(x: torch.Tensor) -> torch.Tensor:
+        e1 = -F.max_pool3d(-x, kernel_size=(3, 1, 1), stride=1, padding=(1, 0, 0))
+        e2 = -F.max_pool3d(-x, kernel_size=(1, 3, 1), stride=1, padding=(0, 1, 0))
+        e3 = -F.max_pool3d(-x, kernel_size=(1, 1, 3), stride=1, padding=(0, 0, 1))
+        return torch.minimum(torch.minimum(e1, e2), e3)
+
+    @staticmethod
+    def _soft_dilate(x: torch.Tensor) -> torch.Tensor:
+        return F.max_pool3d(x, kernel_size=3, stride=1, padding=1)
+
+    @classmethod
+    def _soft_open(cls, x: torch.Tensor) -> torch.Tensor:
+        return cls._soft_dilate(cls._soft_erode(x))
+
+    @classmethod
+    def _soft_skeletonize(cls, x: torch.Tensor, iters: int) -> torch.Tensor:
+        opened = cls._soft_open(x)
+        skel = F.relu(x - opened)
+        for _ in range(iters):
+            x = cls._soft_erode(x)
+            opened = cls._soft_open(x)
+            delta = F.relu(x - opened)
+            skel = skel + (1.0 - skel) * delta
+        return skel
+
+    def _cldice_loss(self, probs: torch.Tensor, target_1h: torch.Tensor) -> torch.Tensor:
+        probs_skel = self._soft_skeletonize(probs, self.cldice_iters)
+        target_skel = self._soft_skeletonize(target_1h, self.cldice_iters)
+        dims = (0, 2, 3, 4)
+        tprec = (probs_skel * target_1h).sum(dims) / (probs_skel.sum(dims) + self.eps)
+        tsens = (target_skel * probs).sum(dims) / (target_skel.sum(dims) + self.eps)
+        cldice_score = (2.0 * tprec * tsens + self.eps) / (tprec + tsens + self.eps)
+        return 1.0 - cldice_score.mean()
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # logits: (N, C, D, H, W), target: (N, D, H, W)
@@ -58,8 +104,17 @@ class DiceCELoss(nn.Module):
         denom = probs.sum(dims) + target_1h.sum(dims)
         dice = (2.0 * inter + self.eps) / (denom + self.eps)
         dice_loss = 1.0 - dice.mean()
+        cldice_loss = (
+            self._cldice_loss(probs, target_1h)
+            if self.cldice_weight > 0.0
+            else torch.zeros((), dtype=logits.dtype, device=logits.device)
+        )
 
-        return self.ce_weight * ce_loss + self.dice_weight * dice_loss
+        return (
+            self.ce_weight * ce_loss
+            + self.dice_weight * dice_loss
+            + self.cldice_weight * cldice_loss
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +169,18 @@ def parse_args() -> argparse.Namespace:
         help="Weight for CE term inside DiceCELoss.",
     )
     parser.add_argument(
+        "--cldice-weight",
+        type=float,
+        default=1.0,
+        help="Weight for clDice term inside DiceCELoss (0 disables clDice).",
+    )
+    parser.add_argument(
+        "--cldice-iters",
+        type=int,
+        default=3,
+        help="Number of iterative soft-skeletonization steps used by clDice.",
+    )
+    parser.add_argument(
         "--ce-weight-min",
         type=float,
         default=None,
@@ -124,6 +191,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional maximum clamp for CE class weights after normalization.",
+    )
+    parser.add_argument(
+        "--enable-ce-class-weights",
+        action="store_true",
+        help=(
+            "Enable inverse-sqrt frequency class weights for CrossEntropyLoss. "
+            "Disabled by default."
+        ),
     )
     parser.add_argument(
         "--rare-class-patch-prob",
@@ -141,6 +216,42 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Maximum patient-presence inverse weight used for rare-class patch "
             "sampling. Higher increases focus on sparse classes."
+        ),
+    )
+    parser.add_argument(
+        "--topbrain-disable",
+        action="store_true",
+        help="Disable TopBrain metric computation during validation.",
+    )
+    parser.add_argument(
+        "--topbrain-track",
+        type=str,
+        default="ct",
+        choices=("ct", "mr"),
+        help="TopBrain track used for metric definitions.",
+    )
+    parser.add_argument(
+        "--topbrain-eval-every-n-epochs",
+        type=int,
+        default=5,
+        help=(
+            "Run full-validation TopBrain metrics every N epochs. "
+            "A final full TopBrain pass is also run after successful training."
+        ),
+    )
+    parser.add_argument(
+        "--topbrain-subset-size",
+        type=int,
+        default=4,
+        help="Fixed validation subset size for per-epoch TopBrain metrics.",
+    )
+    parser.add_argument(
+        "--topbrain-full-max-cases",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on number of validation cases in full TopBrain runs. "
+            "When set, a deterministic subset is used."
         ),
     )
     return parser.parse_args()
@@ -212,6 +323,22 @@ def _flatten_loader_batch(
     x = batch_x.flatten(0, 1)
     y = batch_y.flatten(0, 1)
     return x, y
+
+
+def _topbrain_csv_columns(prefix: str) -> list[str]:
+    return [
+        f"{prefix}_ran",
+        f"{prefix}_num_cases",
+        *[f"{prefix}_{k}" for k in TOPBRAIN_METRIC_KEYS],
+    ]
+
+
+def _topbrain_csv_values(ran: bool, metrics: dict[str, float]) -> list[str]:
+    values = [str(int(ran)), f"{int(metrics['num_cases'])}"]
+    for key in TOPBRAIN_METRIC_KEYS:
+        value = metrics[key]
+        values.append("" if not np.isfinite(value) else f"{value:.6f}")
+    return values
 
 
 def train_one_epoch(
@@ -348,31 +475,85 @@ def main() -> int:
         f"max_weight={args.rare_class_weight_max:.2f}"
     )
 
-    ce_weights = compute_class_weights(
-        label_dir,
-        train_case_ids,
-        num_classes,
-        clamp_min=args.ce_weight_min,
-        clamp_max=args.ce_weight_max,
-    ).to(device)
-    print(
-        f"CE class weights (bg={ce_weights[0]:.3f}, min_fg={ce_weights[1:].min():.3f}, "
-        f"max_fg={ce_weights[1:].max():.3f}, clamp_min={args.ce_weight_min}, "
-        f"clamp_max={args.ce_weight_max})"
-    )
+    if args.topbrain_eval_every_n_epochs <= 0:
+        raise ValueError("--topbrain-eval-every-n-epochs must be >= 1")
+    if args.cldice_weight < 0:
+        raise ValueError("--cldice-weight must be >= 0")
+    if args.cldice_iters < 0:
+        raise ValueError("--cldice-iters must be >= 0")
+    if args.topbrain_subset_size < 0:
+        raise ValueError("--topbrain-subset-size must be >= 0")
+    if args.topbrain_full_max_cases is not None and args.topbrain_full_max_cases <= 0:
+        raise ValueError("--topbrain-full-max-cases must be >= 1 when provided")
+
+    ce_weights = None
+    if args.enable_ce_class_weights:
+        ce_weights = compute_class_weights(
+            label_dir,
+            train_case_ids,
+            num_classes,
+            clamp_min=args.ce_weight_min,
+            clamp_max=args.ce_weight_max,
+        ).to(device)
+        if num_classes > 1:
+            print(
+                f"CE class weights enabled (bg={ce_weights[0]:.3f}, "
+                f"min_fg={ce_weights[1:].min():.3f}, max_fg={ce_weights[1:].max():.3f}, "
+                f"clamp_min={args.ce_weight_min}, clamp_max={args.ce_weight_max})"
+            )
+        else:
+            print(
+                f"CE class weights enabled (w0={ce_weights[0]:.3f}, "
+                f"clamp_min={args.ce_weight_min}, clamp_max={args.ce_weight_max})"
+            )
+    else:
+        print("CE class weights disabled (using unweighted CrossEntropyLoss).")
+        if args.ce_weight_min is not None or args.ce_weight_max is not None:
+            print(
+                "Ignoring --ce-weight-min/--ce-weight-max because "
+                "--enable-ce-class-weights is not set."
+            )
 
     model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
     criterion = DiceCELoss(
         num_classes=num_classes,
         dice_weight=args.dice_weight,
         ce_weight=args.ce_weight,
+        cldice_weight=args.cldice_weight,
+        cldice_iters=args.cldice_iters,
         include_background=False,
         ce_class_weights=ce_weights,
+    )
+    print(
+        "loss weights: "
+        f"ce={args.ce_weight:.3f} dice={args.dice_weight:.3f} "
+        f"cldice={args.cldice_weight:.3f} cldice_iters={args.cldice_iters}"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(args.epochs, 1), eta_min=1e-6
     )
+
+    topbrain_requested = not args.topbrain_disable
+    topbrain_runtime = TopBrainRuntime(track=args.topbrain_track) if topbrain_requested else None
+    topbrain_enabled = bool(topbrain_runtime and topbrain_runtime.available)
+    topbrain_subset_ids = select_fixed_topbrain_subset(
+        case_ids=val_case_ids,
+        subset_size=args.topbrain_subset_size,
+        seed=args.seed,
+    )
+    topbrain_subset_ids_set = set(topbrain_subset_ids)
+    if topbrain_requested:
+        print(
+            "TopBrain validation: "
+            f"enabled={topbrain_enabled} "
+            f"track={args.topbrain_track} "
+            f"subset_size={len(topbrain_subset_ids_set)} "
+            f"full_every_n={args.topbrain_eval_every_n_epochs} "
+            f"full_max_cases={args.topbrain_full_max_cases}"
+        )
+        if topbrain_runtime and not topbrain_runtime.available:
+            print(f"TopBrain disabled (import/runtime error): {topbrain_runtime.error_message}")
 
     with metrics_csv.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -383,7 +564,10 @@ def main() -> int:
                 "train_loss",
                 "val_loss",
                 "val_mean_fg_dice",
+                "val_mean_fg_dice_all_cases_present",
                 *[f"val_dice_c{c:02d}" for c in range(num_classes)],
+                *_topbrain_csv_columns("tb_subset"),
+                *_topbrain_csv_columns("tb_full"),
             ]
         )
 
@@ -392,6 +576,37 @@ def main() -> int:
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
+        run_topbrain_full = (
+            topbrain_enabled
+            and should_run_topbrain_full_eval(epoch, args.topbrain_eval_every_n_epochs)
+        )
+        topbrain_subset_acc = topbrain_runtime.create_accumulator() if topbrain_enabled else None
+        topbrain_full_acc = (
+            topbrain_runtime.create_accumulator() if run_topbrain_full and topbrain_runtime else None
+        )
+        full_case_ids = val_case_ids
+        if run_topbrain_full and args.topbrain_full_max_cases is not None:
+            full_case_ids = select_fixed_topbrain_subset(
+                case_ids=val_case_ids,
+                subset_size=min(args.topbrain_full_max_cases, len(val_case_ids)),
+                seed=args.seed + 10_000,
+            )
+        full_case_ids_set = set(full_case_ids)
+
+        def _topbrain_case_callback(case_id: str, pred_np: np.ndarray, label_path: Path) -> None:
+            if topbrain_subset_acc is not None and case_id in topbrain_subset_ids_set:
+                topbrain_subset_acc.add_case(
+                    case_id=case_id,
+                    pred_xyz=pred_np,
+                    label_path=label_path,
+                )
+            if topbrain_full_acc is not None and case_id in full_case_ids_set:
+                topbrain_full_acc.add_case(
+                    case_id=case_id,
+                    pred_xyz=pred_np,
+                    label_path=label_path,
+                )
+
         train_loss = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -399,7 +614,12 @@ def main() -> int:
             optimizer=optimizer,
             device=device,
         )
-        val_loss, val_mean_fg_dice, per_class_dice = validate_one_epoch(
+        (
+            val_loss,
+            val_mean_fg_dice,
+            val_mean_fg_dice_all_cases_present,
+            per_class_dice,
+        ) = validate_one_epoch(
             model=model,
             val_case_ids=val_case_ids,
             image_dir=image_dir,
@@ -409,6 +629,16 @@ def main() -> int:
             criterion=criterion,
             device=device,
             num_classes=num_classes,
+            topbrain_case_callback=_topbrain_case_callback if topbrain_enabled else None,
+        )
+
+        subset_metrics = (
+            topbrain_subset_acc.finalize()
+            if topbrain_subset_acc is not None
+            else empty_topbrain_metrics()
+        )
+        full_metrics = (
+            topbrain_full_acc.finalize() if topbrain_full_acc is not None else empty_topbrain_metrics()
         )
 
         lr = float(optimizer.param_groups[0]["lr"])
@@ -423,7 +653,16 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     f"{val_mean_fg_dice:.6f}",
+                    (
+                        ""
+                        if not np.isfinite(val_mean_fg_dice_all_cases_present)
+                        else f"{val_mean_fg_dice_all_cases_present:.6f}"
+                    ),
                     *[f"{d:.6f}" for d in per_class_dice],
+                    *_topbrain_csv_values(
+                        topbrain_enabled and bool(topbrain_subset_ids_set), subset_metrics
+                    ),
+                    *_topbrain_csv_values(run_topbrain_full, full_metrics),
                 ]
             )
 
@@ -435,11 +674,88 @@ def main() -> int:
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
             f"lr={lr:.2e} train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f} "
+            "val_mean_fg_dice_all_cases_present="
+            f"{val_mean_fg_dice_all_cases_present:.6f} "
             f"time={elapsed:.1f}s"
         )
         print(
             "per_class_dice: "
             + ", ".join(f"c{idx:02d}={d:.4f}" for idx, d in enumerate(per_class_dice))
+        )
+        if topbrain_enabled:
+            print(
+                "topbrain_subset: "
+                f"cases={int(subset_metrics['num_cases'])} "
+                f"dice={subset_metrics['clsavg_dice']:.4f} "
+                f"cldice={subset_metrics['clsavg_cldice']:.4f} "
+                f"b0={subset_metrics['clsavg_b0']:.4f} "
+                f"hd95={subset_metrics['clsavg_hd95']:.4f} "
+                f"nb_err={subset_metrics['clsavg_invalid_neighbors']:.4f} "
+                f"f1={subset_metrics['sideroad_f1']:.4f}"
+            )
+            if run_topbrain_full:
+                print(
+                    "topbrain_full: "
+                    f"cases={int(full_metrics['num_cases'])} "
+                    f"dice={full_metrics['clsavg_dice']:.4f} "
+                    f"cldice={full_metrics['clsavg_cldice']:.4f} "
+                    f"b0={full_metrics['clsavg_b0']:.4f} "
+                    f"hd95={full_metrics['clsavg_hd95']:.4f} "
+                    f"nb_err={full_metrics['clsavg_invalid_neighbors']:.4f} "
+                    f"f1={full_metrics['sideroad_f1']:.4f}"
+                )
+
+    final_epoch_ran_topbrain_full = (
+        topbrain_enabled
+        and should_run_topbrain_full_eval(args.epochs, args.topbrain_eval_every_n_epochs)
+    )
+    if topbrain_enabled and not final_epoch_ran_topbrain_full and topbrain_runtime:
+        print(
+            "running final TopBrain full validation after successful training "
+            "(ensures end-of-run TopBrain metrics)."
+        )
+        final_topbrain_acc = topbrain_runtime.create_accumulator()
+        final_case_ids = val_case_ids
+        if args.topbrain_full_max_cases is not None:
+            final_case_ids = select_fixed_topbrain_subset(
+                case_ids=val_case_ids,
+                subset_size=min(args.topbrain_full_max_cases, len(val_case_ids)),
+                seed=args.seed + 10_000,
+            )
+        final_case_ids_set = set(final_case_ids)
+
+        def _final_topbrain_case_callback(case_id: str, pred_np: np.ndarray, label_path: Path) -> None:
+            if case_id in final_case_ids_set:
+                final_topbrain_acc.add_case(
+                    case_id=case_id,
+                    pred_xyz=pred_np,
+                    label_path=label_path,
+                )
+
+        _final_val_loss, _final_val_mean_fg_dice, _final_val_mean_fg_dice_all_cases_present, _ = (
+            validate_one_epoch(
+            model=model,
+            val_case_ids=final_case_ids,
+            image_dir=image_dir,
+            label_dir=label_dir,
+            patch_size=patch_size,
+            stride=val_stride,
+            criterion=criterion,
+            device=device,
+            num_classes=num_classes,
+            topbrain_case_callback=_final_topbrain_case_callback,
+            )
+        )
+        final_metrics = final_topbrain_acc.finalize()
+        print(
+            "topbrain_final: "
+            f"cases={int(final_metrics['num_cases'])} "
+            f"dice={final_metrics['clsavg_dice']:.4f} "
+            f"cldice={final_metrics['clsavg_cldice']:.4f} "
+            f"b0={final_metrics['clsavg_b0']:.4f} "
+            f"hd95={final_metrics['clsavg_hd95']:.4f} "
+            f"nb_err={final_metrics['clsavg_invalid_neighbors']:.4f} "
+            f"f1={final_metrics['sideroad_f1']:.4f}"
         )
 
     torch.save(model.state_dict(), final_weights_path)
