@@ -89,6 +89,13 @@ def sample_patches_option_d(
                     idx_pool = fg_indices
                 idx = random.randint(0, len(idx_pool) - 1)
                 cx, cy, cz = idx_pool[idx]
+                sx = cx - px // 2
+                sy = cy - py // 2
+                sz = cz - pz // 2
+
+                sx = max(0, min(sx, x - px))
+                sy = max(0, min(sy, y - py))
+                sz = max(0, min(sz, z - pz))
             elif is_fg:
                 # Pick a random foreground voxel as center
                 idx = random.randint(0, len(fg_indices) - 1)
