@@ -37,7 +37,10 @@ def sample_patches_option_d(
     min_dist: float | None = None,
     rare_class_prob: float = 0.0,
     rare_class_weights: np.ndarray | None = None,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    return_starts: bool = False,
+) -> tuple[list[np.ndarray], list[np.ndarray]] | tuple[
+    list[np.ndarray], list[np.ndarray], list[tuple[int, int, int]]
+]:
     """
     Sample multiple patches from a single volume, ensuring they are not too close.
     Uses Foreground-Aware (Option B) + Minimum Center Distance (Option D).
@@ -62,6 +65,7 @@ def sample_patches_option_d(
     chosen_centers = []
     out_images = []
     out_labels = []
+    out_starts: list[tuple[int, int, int]] = []
 
     max_attempts = 50
 
@@ -129,6 +133,7 @@ def sample_patches_option_d(
                 chosen_centers.append(center)
                 out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
                 out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
+                out_starts.append((sx, sy, sz))
                 patch_found = True
                 break
 
@@ -137,7 +142,10 @@ def sample_patches_option_d(
             chosen_centers.append(center)
             out_images.append(image[sx : sx + px, sy : sy + py, sz : sz + pz])
             out_labels.append(label[sx : sx + px, sy : sy + py, sz : sz + pz])
+            out_starts.append((sx, sy, sz))
 
+    if return_starts:
+        return out_images, out_labels, out_starts
     return out_images, out_labels
 
 
@@ -208,6 +216,7 @@ class CTAPatchDataset(Dataset):
         num_patches: int = 4,
         rare_class_prob: float = 0.0,
         rare_class_weights: np.ndarray | None = None,
+        target_skeleton_dir: Path | None = None,
     ) -> None:
         self.case_ids = list(case_ids)
         self.image_dir = image_dir
@@ -219,11 +228,16 @@ class CTAPatchDataset(Dataset):
         self.num_patches = num_patches
         self.rare_class_prob = float(np.clip(rare_class_prob, 0.0, 1.0))
         self.rare_class_weights = rare_class_weights
+        self.target_skeleton_dir = target_skeleton_dir
 
     def __len__(self) -> int:
         return len(self.case_ids)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, str]:
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, str] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, str
+    ]:
         case_id = self.case_ids[idx]
         image_path = self.image_dir / f"{case_id}_0000.nii.gz"
         label_path = self.label_dir / f"{case_id}.nii.gz"
@@ -250,21 +264,60 @@ class CTAPatchDataset(Dataset):
                     f"Patch size {self.patch_size} is larger than volume shape {image.shape} for {case_id}"
                 )
 
-        images, labels = sample_patches_option_d(
+        sample_output = sample_patches_option_d(
             image,
             label,
             self.patch_size,
             num_patches=self.num_patches,
             rare_class_prob=self.rare_class_prob,
             rare_class_weights=self.rare_class_weights,
+            return_starts=self.target_skeleton_dir is not None,
         )
+        if self.target_skeleton_dir is None:
+            images, labels = sample_output  # type: ignore[misc]
+            starts: list[tuple[int, int, int]] = []
+        else:
+            images, labels, starts = sample_output  # type: ignore[misc]
         out_img_tensors = []
         out_lbl_tensors = []
-        for img, lbl in zip(images, labels):
+        out_skel_tensors = []
+        skel_volume: np.ndarray | None = None
+        if self.target_skeleton_dir is not None:
+            skel_path = self.target_skeleton_dir / f"{case_id}.npz"
+            if not skel_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing target skeleton file for {case_id}: {skel_path}"
+                )
+            with np.load(skel_path) as data:
+                if "skel" not in data:
+                    raise KeyError(f"Expected key 'skel' in {skel_path}")
+                skel_volume = data["skel"].astype(np.float32)
+            if skel_volume.ndim != 4:
+                raise ValueError(
+                    f"Invalid skeleton shape for {case_id}: {skel_volume.shape}, expected (C, D, H, W)"
+                )
+            if skel_volume.shape[1:] != image.shape:
+                raise ValueError(
+                    f"Skeleton/image shape mismatch for {case_id}: "
+                    f"skel={skel_volume.shape[1:]}, image={image.shape}"
+                )
+        for patch_idx, (img, lbl) in enumerate(zip(images, labels)):
+            skel_patch = None
+            if skel_volume is not None:
+                sx, sy, sz = starts[patch_idx]
+                px, py, pz = self.patch_size
+                skel_patch = skel_volume[:, sx : sx + px, sy : sy + py, sz : sz + pz]
             if self.do_augment:
-                img, lbl = random_flip_3d(img, lbl, p=0.5)
+                for axis in (0, 1, 2):
+                    if random.random() < 0.5:
+                        img = np.flip(img, axis=axis).copy()
+                        lbl = np.flip(lbl, axis=axis).copy()
+                        if skel_patch is not None:
+                            skel_patch = np.flip(skel_patch, axis=axis + 1).copy()
             out_img_tensors.append(torch.from_numpy(img).float().unsqueeze(0))
             out_lbl_tensors.append(torch.from_numpy(lbl).long())
+            if skel_patch is not None:
+                out_skel_tensors.append(torch.from_numpy(skel_patch).float())
 
         image_t = torch.stack(out_img_tensors)  # (num_patches, 1, D, H, W)
         label_t = torch.stack(out_lbl_tensors)  # (num_patches, D, H, W)
@@ -275,6 +328,9 @@ class CTAPatchDataset(Dataset):
                 f"num_classes={self.num_classes}"
             )
 
+        if self.target_skeleton_dir is not None:
+            skel_t = torch.stack(out_skel_tensors)  # (num_patches, C, D, H, W)
+            return image_t, label_t, skel_t, case_id
         return image_t, label_t, case_id
 
 
@@ -291,6 +347,7 @@ def build_train_val_loaders(
     num_workers: int = 0,
     rare_class_patch_prob: float = 0.35,
     rare_class_weight_max: float = 4.0,
+    target_skeleton_dir: Path | None = None,
 ) -> tuple[CTAPatchDataset, list[str], DataLoader, int]:
     """
     Build CTA train dataset + loader and return validation case IDs.
@@ -345,6 +402,7 @@ def build_train_val_loaders(
         num_patches=num_patches_per_volume,
         rare_class_prob=rare_class_patch_prob,
         rare_class_weights=rare_class_weights,
+        target_skeleton_dir=target_skeleton_dir,
     )
     train_loader = DataLoader(
         train_ds,

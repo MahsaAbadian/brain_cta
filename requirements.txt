@@ -10,3 +10,6 @@ pandas==2.0.3
 scikit-image==0.21.0
 # Training (install before running src/train.py)
 torch
+# Optional: 3D visualization for clDice skeleton debugging
+pyvista
+vtk

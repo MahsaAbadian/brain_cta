@@ -31,6 +31,21 @@ from topbrain_validation import (
 from validation import validate_one_epoch
 
 
+def _parse_class_id_list(raw: str | None) -> tuple[int, ...] | None:
+    if raw is None:
+        return None
+    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    if len(tokens) == 0:
+        return None
+    try:
+        values = tuple(int(tok) for tok in tokens)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --cldice-class-ids='{raw}'. Expected comma-separated integers."
+        ) from exc
+    return tuple(sorted(set(values)))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train baseline 3D U-Net on resampled CTA data.")
     parser.add_argument("--epochs", type=int, default=40)
@@ -91,16 +106,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cldice-iters",
         type=int,
-        default=3,
+        default=12,
         help="Number of iterative soft-skeletonization steps used by clDice.",
     )
     parser.add_argument(
-        "--cldice-downsample",
-        type=int,
-        default=2,
+        "--cldice-class-ids",
+        type=str,
+        default=None,
         help=(
-            "Spatial downsample factor before clDice skeletonization. "
-            "2 = half resolution per axis (8x less VRAM). Set 1 to disable."
+            "Optional comma-separated class IDs to include in clDice. "
+            "Example: '1,2,7'. Dice/CE still use all classes."
+        ),
+    )
+    parser.add_argument(
+        "--cldice-target-skeleton-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory containing precomputed target skeleton files "
+            "named <case_id>.npz with key 'skel'."
         ),
     )
     parser.add_argument(
@@ -238,14 +262,17 @@ def _set_seed(seed: int) -> None:
 
 
 def _flatten_loader_batch(
-    batch_x: torch.Tensor, batch_y: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_x: torch.Tensor,
+    batch_y: torch.Tensor,
+    batch_skel: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # data_loader returns:
     # image: (B_volume, Patches, C, D, H, W)
     # label: (B_volume, Patches, D, H, W)
     x = batch_x.flatten(0, 1)
     y = batch_y.flatten(0, 1)
-    return x, y
+    skel = batch_skel.flatten(0, 1) if batch_skel is not None else None
+    return x, y, skel
 
 
 def _topbrain_csv_columns(prefix: str) -> list[str]:
@@ -274,14 +301,21 @@ def train_one_epoch(
     model.train()
     running_loss = 0.0
     n_steps = 0
-    for batch_x, batch_y, _ in loader:
-        batch_x, batch_y = _flatten_loader_batch(batch_x, batch_y)
+    for batch in loader:
+        batch_skel = None
+        if len(batch) == 4:
+            batch_x, batch_y, batch_skel, _ = batch
+        else:
+            batch_x, batch_y, _ = batch
+        batch_x, batch_y, batch_skel = _flatten_loader_batch(batch_x, batch_y, batch_skel)
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
+        if batch_skel is not None:
+            batch_skel = batch_skel.to(device)
 
         optimizer.zero_grad()
         logits = model(batch_x)
-        loss = criterion(logits, batch_y)
+        loss = criterion(logits, batch_y, target_skel=batch_skel)
         loss.backward()
         optimizer.step()
 
@@ -300,6 +334,7 @@ def _build_overfit_loaders(
     disable_augment: bool,
     rare_class_patch_prob: float,
     rare_class_weight_max: float,
+    target_skeleton_dir: Path | None,
 ) -> tuple[DataLoader, int]:
     image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
     label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
@@ -331,6 +366,7 @@ def _build_overfit_loaders(
         num_patches=num_patches_per_volume,
         rare_class_prob=rare_class_patch_prob,
         rare_class_weights=rare_class_weights,
+        target_skeleton_dir=target_skeleton_dir,
     )
     train_loader = DataLoader(
         train_ds,
@@ -343,6 +379,12 @@ def _build_overfit_loaders(
 
 def main() -> int:
     args = parse_args()
+    cldice_class_ids = _parse_class_id_list(args.cldice_class_ids)
+    target_skeleton_dir = args.cldice_target_skeleton_dir
+    if target_skeleton_dir is not None and not target_skeleton_dir.is_dir():
+        raise FileNotFoundError(
+            f"--cldice-target-skeleton-dir does not exist: {target_skeleton_dir}"
+        )
     _set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
@@ -370,6 +412,7 @@ def main() -> int:
             disable_augment=args.overfit_disable_augment,
             rare_class_patch_prob=args.rare_class_patch_prob,
             rare_class_weight_max=args.rare_class_weight_max,
+            target_skeleton_dir=target_skeleton_dir,
         )
         train_case_ids = [args.overfit_case_id]
         val_case_ids = [args.overfit_case_id]
@@ -386,6 +429,7 @@ def main() -> int:
             num_workers=args.num_workers,
             rare_class_patch_prob=args.rare_class_patch_prob,
             rare_class_weight_max=args.rare_class_weight_max,
+            target_skeleton_dir=target_skeleton_dir,
         )
         train_case_ids = train_ds.case_ids
     print(
@@ -444,7 +488,7 @@ def main() -> int:
         ce_weight=args.ce_weight,
         cldice_weight=args.cldice_weight,
         cldice_iters=args.cldice_iters,
-        cldice_downsample=args.cldice_downsample,
+        cldice_class_ids=cldice_class_ids,
         include_background=False,
         ce_class_weights=ce_weights,
     )
@@ -452,7 +496,8 @@ def main() -> int:
         "loss weights: "
         f"ce={args.ce_weight:.3f} dice={args.dice_weight:.3f} "
         f"cldice={args.cldice_weight:.3f} cldice_iters={args.cldice_iters} "
-        f"cldice_downsample={args.cldice_downsample}"
+        f"cldice_class_ids={cldice_class_ids} "
+        f"precomputed_target_skeletons={target_skeleton_dir}"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
