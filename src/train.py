@@ -46,6 +46,83 @@ def _parse_class_id_list(raw: str | None) -> tuple[int, ...] | None:
     return tuple(sorted(set(values)))
 
 
+def _resolve_expected_cldice_class_ids(
+    *,
+    num_classes: int,
+    include_background: bool,
+    cldice_class_ids: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    if cldice_class_ids is None:
+        start = 0 if include_background else 1
+        return tuple(range(start, num_classes))
+
+    expected: list[int] = []
+    for class_id in sorted(set(cldice_class_ids)):
+        if class_id < 0 or class_id >= num_classes:
+            raise ValueError(
+                f"Invalid clDice class id {class_id}; valid range is [0, {num_classes - 1}]"
+            )
+        if (not include_background) and class_id == 0:
+            continue
+        expected.append(class_id)
+    if len(expected) == 0:
+        raise ValueError(
+            "clDice class selection is empty after background filtering. "
+            "Provide at least one foreground class id."
+        )
+    return tuple(expected)
+
+
+def _validate_target_skeleton_dir(
+    *,
+    target_skeleton_dir: Path,
+    train_case_ids: list[str],
+    expected_class_ids: tuple[int, ...],
+) -> None:
+    missing = [
+        case_id
+        for case_id in train_case_ids
+        if not (target_skeleton_dir / f"{case_id}.npz").is_file()
+    ]
+    if missing:
+        preview = ", ".join(missing[:5])
+        more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise FileNotFoundError(
+            "Missing precomputed target skeleton files for training cases in "
+            f"{target_skeleton_dir}: {preview}{more}"
+        )
+
+    sample_path = target_skeleton_dir / f"{train_case_ids[0]}.npz"
+    with np.load(sample_path) as sample:
+        if "skel" not in sample:
+            raise KeyError(f"Expected key 'skel' in {sample_path}")
+        skel = sample["skel"]
+        if skel.ndim != 4:
+            raise ValueError(
+                f"Invalid precomputed skeleton shape in {sample_path}: "
+                f"{skel.shape}. Expected (C, D, H, W)."
+            )
+        if skel.shape[0] != len(expected_class_ids):
+            raise ValueError(
+                "Precomputed skeleton channel mismatch. "
+                f"Expected {len(expected_class_ids)} channels from clDice class IDs "
+                f"{expected_class_ids}, got {skel.shape[0]} in {sample_path}."
+            )
+
+        if "class_ids" in sample:
+            file_class_ids = tuple(int(x) for x in sample["class_ids"].tolist())
+            if file_class_ids != expected_class_ids:
+                raise ValueError(
+                    "Precomputed skeleton class_ids metadata mismatch. "
+                    f"Expected {expected_class_ids}, got {file_class_ids} in {sample_path}."
+                )
+        method = str(sample["method"][0]) if "method" in sample else "unknown"
+    print(
+        "validated precomputed target skeletons: "
+        f"dir={target_skeleton_dir} channels={len(expected_class_ids)} method={method}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train baseline 3D U-Net on resampled CTA data.")
     parser.add_argument("--epochs", type=int, default=40)
@@ -492,6 +569,17 @@ def main() -> int:
         include_background=False,
         ce_class_weights=ce_weights,
     )
+    if target_skeleton_dir is not None:
+        expected_class_ids = _resolve_expected_cldice_class_ids(
+            num_classes=num_classes,
+            include_background=False,
+            cldice_class_ids=cldice_class_ids,
+        )
+        _validate_target_skeleton_dir(
+            target_skeleton_dir=target_skeleton_dir,
+            train_case_ids=train_case_ids,
+            expected_class_ids=expected_class_ids,
+        )
     print(
         "loss weights: "
         f"ce={args.ce_weight:.3f} dice={args.dice_weight:.3f} "

@@ -6,7 +6,14 @@ import pprint
 
 import numpy as np
 import SimpleITK as sitk
-from skimage.morphology import skeletonize, skeletonize_3d
+try:
+    from skimage.morphology import skeletonize, skeletonize_3d
+except ImportError:
+    from skimage.morphology import skeletonize
+
+    # skimage>=0.25 removed skeletonize_3d; Lee method on 3D matches the intent.
+    def skeletonize_3d(image: np.ndarray) -> np.ndarray:
+        return skeletonize(image, method="lee")
 from topbrain25_eval.constants import TRACK
 from topbrain25_eval.metrics.generate_cls_avg_dict import generate_cls_avg_dict
 from topbrain25_eval.utils.utils_mask import convert_multiclass_to_binary
