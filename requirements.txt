@@ -1,5 +1,6 @@
 SimpleITK
-numpy
+# NumPy 2.0 removes np.float_; TopBrain eval stack (evalutils, etc.) expects 1.x
+numpy>=1.25.2,<2.0
 scipy
 pytest
 nibabel
