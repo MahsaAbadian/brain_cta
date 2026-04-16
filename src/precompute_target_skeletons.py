@@ -12,9 +12,37 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-from skimage.morphology import skeletonize  # pyright: ignore[reportMissingImports]
 
 from data_utils import read_num_classes_from_labelmap
+
+
+def _import_skeletonize_lee():
+    """Import skimage skeletonize with a NumPy 2.x compatibility shim.
+
+    Some environments accidentally install scikit-image versions that still
+    reference removed NumPy aliases (for example `np.float_`), which crashes at
+    import time. We patch those aliases only when missing, then retry import.
+    """
+    try:
+        from skimage.morphology import skeletonize  # pyright: ignore[reportMissingImports]
+        return skeletonize
+    except Exception as exc:
+        err = str(exc)
+        if "np.float_" in err and not hasattr(np, "float_"):
+            np.float_ = np.float64  # type: ignore[attr-defined]
+            try:
+                from skimage.morphology import skeletonize  # pyright: ignore[reportMissingImports]
+                return skeletonize
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    "Failed to import scikit-image skeletonize after NumPy compatibility shim. "
+                    "Use compatible deps, e.g. `pip install 'numpy<2' 'scikit-image==0.21.0'` "
+                    "or upgrade scikit-image to a NumPy-2-compatible release."
+                ) from retry_exc
+        raise RuntimeError(
+            "Failed to import scikit-image skeletonize. "
+            "Install compatible deps, e.g. `pip install 'numpy<2' 'scikit-image==0.21.0'`."
+        ) from exc
 
 
 def _parse_class_id_list(raw: str | None) -> tuple[int, ...] | None:
@@ -148,6 +176,9 @@ def main() -> int:
         )
 
     use_lee = args.method == "lee"
+    skeletonize_lee = None
+    if use_lee:
+        skeletonize_lee = _import_skeletonize_lee()
 
     device = None
     if not use_lee:
@@ -188,7 +219,7 @@ def main() -> int:
             mask_bool = (label_np == class_id)
 
             if use_lee:
-                skel_channels[ch_idx] = skeletonize(
+                skel_channels[ch_idx] = skeletonize_lee(
                     mask_bool, method="lee"
                 ).astype(np.float32)
             else:
