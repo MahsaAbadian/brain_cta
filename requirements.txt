@@ -6,7 +6,9 @@ pytest
 nibabel
 # TopBrain runtime deps (match TopBrain_Eval_Metrics-master/pyproject.toml)
 evalutils==0.4.2
-pandas==2.0.3
+# pandas==2.0.3 has no wheel for Python 3.12 and fails from source on fresh instances
+pandas==2.0.3; python_version < "3.12"
+pandas>=2.2,<2.3; python_version >= "3.12"
 scikit-image==0.21.0
 # Training (install before running src/train.py)
 torch

@@ -143,6 +143,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--base-ch", type=int, default=16)
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help=(
+            "Device to use for training. 'auto' prefers CUDA but falls back to CPU "
+            "if CUDA initialization fails."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))
     parser.add_argument(
@@ -248,6 +258,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable TopBrain metric computation during validation.",
     )
     parser.add_argument(
+        "--topbrain-per-epoch",
+        action="store_true",
+        help=(
+            "Run TopBrain during training validation (subset every epoch; full every N). "
+            "Default is to run TopBrain once after the last training epoch only."
+        ),
+    )
+    parser.add_argument(
         "--topbrain-track",
         type=str,
         default="ct",
@@ -259,15 +277,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help=(
-            "Run full-validation TopBrain metrics every N epochs. "
-            "A final full TopBrain pass is also run after successful training."
+            "When --topbrain-per-epoch is set: run full-validation TopBrain metrics every N epochs. "
+            "Ignored when TopBrain runs only at end."
         ),
     )
     parser.add_argument(
         "--topbrain-subset-size",
         type=int,
         default=4,
-        help="Fixed validation subset size for per-epoch TopBrain metrics.",
+        help=(
+            "When --topbrain-per-epoch is set: fixed validation subset size for each epoch's TopBrain."
+        ),
     )
     parser.add_argument(
         "--topbrain-full-max-cases",
@@ -463,7 +483,7 @@ def main() -> int:
             f"--cldice-target-skeleton-dir does not exist: {target_skeleton_dir}"
         )
     _set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device(args.device)
     print(f"device={device}")
 
     out_dir: Path = args.out_dir
@@ -595,17 +615,21 @@ def main() -> int:
     topbrain_requested = not args.topbrain_disable
     topbrain_runtime = TopBrainRuntime(track=args.topbrain_track) if topbrain_requested else None
     topbrain_enabled = bool(topbrain_runtime and topbrain_runtime.available)
-    topbrain_subset_ids = select_fixed_topbrain_subset(
-        case_ids=val_case_ids,
-        subset_size=args.topbrain_subset_size,
-        seed=args.seed,
-    )
-    topbrain_subset_ids_set = set(topbrain_subset_ids)
+    topbrain_subset_ids: list[str] = []
+    topbrain_subset_ids_set: set[str] = set()
+    if topbrain_requested and args.topbrain_per_epoch:
+        topbrain_subset_ids = select_fixed_topbrain_subset(
+            case_ids=val_case_ids,
+            subset_size=args.topbrain_subset_size,
+            seed=args.seed,
+        )
+        topbrain_subset_ids_set = set(topbrain_subset_ids)
     if topbrain_requested:
         print(
             "TopBrain validation: "
             f"enabled={topbrain_enabled} "
             f"track={args.topbrain_track} "
+            f"when={'each_epoch' if args.topbrain_per_epoch else 'end_only'} "
             f"subset_size={len(topbrain_subset_ids_set)} "
             f"full_every_n={args.topbrain_eval_every_n_epochs} "
             f"full_max_cases={args.topbrain_full_max_cases}"
@@ -634,11 +658,14 @@ def main() -> int:
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
+        run_topbrain_this_epoch = topbrain_enabled and args.topbrain_per_epoch
         run_topbrain_full = (
-            topbrain_enabled
+            run_topbrain_this_epoch
             and should_run_topbrain_full_eval(epoch, args.topbrain_eval_every_n_epochs)
         )
-        topbrain_subset_acc = topbrain_runtime.create_accumulator() if topbrain_enabled else None
+        topbrain_subset_acc = (
+            topbrain_runtime.create_accumulator() if run_topbrain_this_epoch else None
+        )
         topbrain_full_acc = (
             topbrain_runtime.create_accumulator() if run_topbrain_full and topbrain_runtime else None
         )
@@ -687,7 +714,7 @@ def main() -> int:
             criterion=criterion,
             device=device,
             num_classes=num_classes,
-            topbrain_case_callback=_topbrain_case_callback if topbrain_enabled else None,
+            topbrain_case_callback=_topbrain_case_callback if run_topbrain_this_epoch else None,
         )
 
         subset_metrics = (
@@ -718,7 +745,8 @@ def main() -> int:
                     ),
                     *[f"{d:.6f}" for d in per_class_dice],
                     *_topbrain_csv_values(
-                        topbrain_enabled and bool(topbrain_subset_ids_set), subset_metrics
+                        run_topbrain_this_epoch and bool(topbrain_subset_ids_set),
+                        subset_metrics,
                     ),
                     *_topbrain_csv_values(run_topbrain_full, full_metrics),
                 ]
@@ -740,7 +768,7 @@ def main() -> int:
             "per_class_dice: "
             + ", ".join(f"c{idx:02d}={d:.4f}" for idx, d in enumerate(per_class_dice))
         )
-        if topbrain_enabled:
+        if run_topbrain_this_epoch:
             print(
                 "topbrain_subset: "
                 f"cases={int(subset_metrics['num_cases'])} "
@@ -765,12 +793,16 @@ def main() -> int:
 
     final_epoch_ran_topbrain_full = (
         topbrain_enabled
+        and args.topbrain_per_epoch
         and should_run_topbrain_full_eval(args.epochs, args.topbrain_eval_every_n_epochs)
     )
-    if topbrain_enabled and not final_epoch_ran_topbrain_full and topbrain_runtime:
+    need_final_topbrain = topbrain_enabled and topbrain_runtime and (
+        not args.topbrain_per_epoch or not final_epoch_ran_topbrain_full
+    )
+    if need_final_topbrain:
         print(
-            "running final TopBrain full validation after successful training "
-            "(ensures end-of-run TopBrain metrics)."
+            "running TopBrain validation after training "
+            "(end-of-run metrics on the validation set)."
         )
         final_topbrain_acc = topbrain_runtime.create_accumulator()
         final_case_ids = val_case_ids

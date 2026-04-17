@@ -2,6 +2,7 @@
 Class-average 0-th Betti number error
 """
 
+import os
 import pprint
 
 import numpy as np
@@ -10,6 +11,14 @@ from skimage import measure
 from topbrain25_eval.constants import TRACK
 from topbrain25_eval.metrics.generate_cls_avg_dict import generate_cls_avg_dict
 from topbrain25_eval.utils.utils_mask import arr_is_binary
+
+
+def _eval_verbose() -> bool:
+    return os.environ.get("TOPBRAIN_EVAL_VERBOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def connected_components(img: np.array) -> tuple[int, list, list]:
@@ -56,14 +65,16 @@ def connected_components(img: np.array) -> tuple[int, list, list]:
         connectivity=N26,
     )
 
-    print(f"# b0 = {b0}")
+    if _eval_verbose():
+        print(f"# b0 = {b0}")
 
     # get the properties of the connected regions
     # by skimage.measure.regionprops() function
     props = measure.regionprops(b0_labels)
     sizes = [obj.area for obj in props]
     sizes.sort()
-    print(f"sorted sizes = {sizes}")
+    if _eval_verbose():
+        print(f"sorted sizes = {sizes}")
 
     return int(b0), props, sizes
 
@@ -75,7 +86,8 @@ def betti_number_error_single_label(
     integrate connected_components() to the template that metric_func expects:
         (gt, pred, label) => score/Tuple[scores]
     """
-    print(f"\n--> betti_number_error_single_label() for label-{label}\n")
+    if _eval_verbose():
+        print(f"\n--> betti_number_error_single_label() for label-{label}\n")
 
     # gt and pred should have the same shape
     assert gt.GetSize() == pred.GetSize(), "gt pred not matching shapes!"
@@ -95,16 +107,20 @@ def betti_number_error_single_label(
     assert arr_is_binary(pred_label_arr), "expects binary pred_arr"
 
     # if filtered label_arr is blank, b0 = 0
-    print("~~~ gt_b0 ~~~")
+    if _eval_verbose():
+        print("~~~ gt_b0 ~~~")
     if not np.any(gt_label_arr):
-        print("blank")
+        if _eval_verbose():
+            print("blank")
         gt_b0 = 0
     else:
         gt_b0 = connected_components(gt_label_arr)[0]
 
-    print("~~~ pred_b0 ~~~")
+    if _eval_verbose():
+        print("~~~ pred_b0 ~~~")
     if not np.any(pred_label_arr):
-        print("blank")
+        if _eval_verbose():
+            print("blank")
         pred_b0 = 0
     else:
         pred_b0 = connected_components(pred_label_arr)[0]
@@ -128,6 +144,7 @@ def betti_number_error_all_classes(
         metric_keys=["B0err"],
         metric_func=betti_number_error_single_label,
     )
-    print("\nbetti_number_error_all_classes() =>")
-    pprint.pprint(betti_num_err_dict, sort_dicts=False)
+    if _eval_verbose():
+        print("\nbetti_number_error_all_classes() =>")
+        pprint.pprint(betti_num_err_dict, sort_dicts=False)
     return betti_num_err_dict
