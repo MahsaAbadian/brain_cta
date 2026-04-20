@@ -215,6 +215,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cldice-channel-chunk",
+        type=int,
+        default=0,
+        help=(
+            "Process clDice skeletonization in chunks of this many channels "
+            "(0 = all channels at once, legacy behavior). Soft-skeletonize is "
+            "channel-independent so chunking is bit-exact but cuts peak "
+            "skeletonize memory by roughly chunk/total_channels. Use small "
+            "values (1-4) to trade extra step time for OOM relief."
+        ),
+    )
+    parser.add_argument(
         "--ce-weight-min",
         type=float,
         default=None,
@@ -667,6 +679,7 @@ def main() -> int:
         cldice_class_ids=cldice_class_ids,
         include_background=False,
         ce_class_weights=ce_weights,
+        cldice_channel_chunk=args.cldice_channel_chunk,
     )
     if target_skeleton_dir is not None:
         expected_class_ids = _resolve_expected_cldice_class_ids(
@@ -684,6 +697,7 @@ def main() -> int:
         f"ce={args.ce_weight:.3f} dice={args.dice_weight:.3f} "
         f"cldice={args.cldice_weight:.3f} cldice_iters={args.cldice_iters} "
         f"cldice_class_ids={cldice_class_ids} "
+        f"cldice_channel_chunk={args.cldice_channel_chunk} "
         f"precomputed_target_skeletons={target_skeleton_dir}"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

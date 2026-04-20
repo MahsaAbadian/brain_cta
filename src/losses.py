@@ -20,6 +20,7 @@ class DiceCELoss(nn.Module):
         include_background: bool = True,
         eps: float = 1e-6,
         ce_class_weights: torch.Tensor | None = None,
+        cldice_channel_chunk: int = 0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -30,6 +31,18 @@ class DiceCELoss(nn.Module):
         self.cldice_class_ids = cldice_class_ids
         self.include_background = include_background
         self.eps = eps
+        # cldice_channel_chunk:
+        #   0  -> process all clDice channels at once (legacy behavior).
+        #   >0 -> process at most this many channels per skeletonize call,
+        #         accumulating per-class numerators/denominators across chunks.
+        # Soft-skeletonize is channel-independent (max_pool3d / pointwise ops),
+        # so chunked evaluation is mathematically identical to all-at-once but
+        # with peak memory scaled by ~chunk/total_channels.
+        if cldice_channel_chunk < 0:
+            raise ValueError(
+                f"cldice_channel_chunk must be >= 0, got {cldice_channel_chunk}"
+            )
+        self.cldice_channel_chunk = int(cldice_channel_chunk)
         self.ce = nn.CrossEntropyLoss(weight=ce_class_weights)
         self._cldice_channel_indices = self._build_cldice_channel_indices()
 
@@ -122,6 +135,61 @@ class DiceCELoss(nn.Module):
             probs, target_1h, target_skel
         )
 
+        num_channels = probs.shape[1]
+        chunk = self.cldice_channel_chunk
+        if chunk <= 0 or chunk >= num_channels:
+            # Fast path: one big skeletonize call, legacy behavior.
+            return self._cldice_loss_chunk(probs, target_1h, target_skel)
+
+        # Chunked path: loop over contiguous channel groups and accumulate
+        # per-class numerator / denominator pairs separately for tprec and
+        # tsens. Each chunk's skeletonize graph is an independent autograd
+        # subgraph (it calls _skeletonize_checkpointed internally), so during
+        # backward the recompute activations from chunk i are freed before
+        # chunk i+1's are rebuilt. Peak memory is therefore set by `chunk`,
+        # not by `num_channels`.
+        tprec_num_parts: list[torch.Tensor] = []
+        tprec_den_parts: list[torch.Tensor] = []
+        tsens_num_parts: list[torch.Tensor] = []
+        tsens_den_parts: list[torch.Tensor] = []
+        dims = (0, 2, 3, 4)
+        for start in range(0, num_channels, chunk):
+            end = min(start + chunk, num_channels)
+            probs_c = probs[:, start:end]
+            target_1h_c = target_1h[:, start:end]
+            target_skel_c = (
+                target_skel[:, start:end] if target_skel is not None else None
+            )
+            probs_skel_c = self._skeletonize_checkpointed(probs_c, self.cldice_iters)
+            if target_skel_c is None:
+                target_skel_c = self._skeletonize_checkpointed(
+                    target_1h_c, self.cldice_iters
+                )
+            probs_skel_c = probs_skel_c.float()
+            target_skel_c = target_skel_c.float()
+            probs_c = probs_c.float()
+            target_1h_c = target_1h_c.float()
+            tprec_num_parts.append((probs_skel_c * target_1h_c).sum(dims))
+            tprec_den_parts.append(probs_skel_c.sum(dims))
+            tsens_num_parts.append((target_skel_c * probs_c).sum(dims))
+            tsens_den_parts.append(target_skel_c.sum(dims))
+
+        tprec_num = torch.cat(tprec_num_parts)
+        tprec_den = torch.cat(tprec_den_parts)
+        tsens_num = torch.cat(tsens_num_parts)
+        tsens_den = torch.cat(tsens_den_parts)
+        tprec = tprec_num / (tprec_den + self.eps)
+        tsens = tsens_num / (tsens_den + self.eps)
+        cldice_score = (2.0 * tprec * tsens) / (tprec + tsens + self.eps)
+        return 1.0 - cldice_score.mean()
+
+    def _cldice_loss_chunk(
+        self,
+        probs: torch.Tensor,
+        target_1h: torch.Tensor,
+        target_skel: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Original, all-channels-at-once clDice computation for a single chunk."""
         probs_skel = self._skeletonize_checkpointed(probs, self.cldice_iters)
         if target_skel is None:
             target_skel = self._skeletonize_checkpointed(target_1h, self.cldice_iters)
