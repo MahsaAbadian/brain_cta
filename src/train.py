@@ -298,6 +298,25 @@ def parse_args() -> argparse.Namespace:
             "When set, a deterministic subset is used."
         ),
     )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help=(
+            "Enable CUDA mixed-precision training (autocast + GradScaler). "
+            "Significantly reduces activation memory and speeds up training on "
+            "modern GPUs. Requires --device=cuda (or auto-resolved to cuda)."
+        ),
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=("fp16", "bf16"),
+        default="fp16",
+        help=(
+            "Autocast dtype when --amp is set. 'bf16' is safer (no GradScaler "
+            "needed for dynamic range) on Ampere+ GPUs; 'fp16' is the default."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -426,10 +445,13 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: torch.amp.GradScaler | None = None,
+    amp_dtype: torch.dtype | None = None,
 ) -> float:
     model.train()
     running_loss = 0.0
     n_steps = 0
+    use_amp = scaler is not None and amp_dtype is not None and device.type == "cuda"
     for batch in loader:
         batch_skel = None
         if len(batch) == 4:
@@ -442,11 +464,19 @@ def train_one_epoch(
         if batch_skel is not None:
             batch_skel = batch_skel.to(device)
 
-        optimizer.zero_grad()
-        logits = model(batch_x)
-        loss = criterion(logits, batch_y, target_skel=batch_skel)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(batch_x)
+                loss = criterion(logits, batch_y, target_skel=batch_skel)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(batch_x)
+            loss = criterion(logits, batch_y, target_skel=batch_skel)
+            loss.backward()
+            optimizer.step()
 
         running_loss += float(loss.item())
         n_steps += 1
@@ -644,6 +674,21 @@ def main() -> int:
         optimizer, T_max=max(args.epochs, 1), eta_min=1e-6
     )
 
+    amp_enabled = bool(args.amp) and device.type == "cuda"
+    amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
+    # bf16 has fp32's dynamic range, so GradScaler is unnecessary (and unsupported
+    # by torch.amp.GradScaler for bf16 on CUDA). Use a no-op scaler semantics by
+    # passing enabled=False when amp_dtype is bf16.
+    scaler: torch.amp.GradScaler | None = (
+        torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype is torch.float16))
+        if amp_enabled
+        else None
+    )
+    if args.amp and not amp_enabled:
+        print("warning: --amp ignored because device is not CUDA.")
+    if amp_enabled:
+        print(f"AMP enabled: dtype={args.amp_dtype} grad_scaler={scaler.is_enabled() if scaler else False}")
+
     topbrain_requested = not args.topbrain_disable
     topbrain_runtime = TopBrainRuntime(track=args.topbrain_track) if topbrain_requested else None
     topbrain_enabled = bool(topbrain_runtime and topbrain_runtime.available)
@@ -730,6 +775,8 @@ def main() -> int:
             criterion=criterion,
             optimizer=optimizer,
             device=device,
+            scaler=scaler,
+            amp_dtype=amp_dtype if amp_enabled else None,
         )
         (
             val_loss,
