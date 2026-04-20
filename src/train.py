@@ -358,6 +358,38 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _resolve_device(device_arg: str) -> torch.device:
+    """Resolve user device choice with safe CUDA fallback for --device=auto."""
+    if device_arg == "cpu":
+        return torch.device("cpu")
+
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--device=cuda requested, but CUDA is not available in this environment."
+            )
+        try:
+            # Force a tiny allocation so runtime/driver issues fail early.
+            torch.empty(1, device="cuda")
+        except Exception as exc:
+            raise RuntimeError(
+                "--device=cuda requested, but CUDA failed to initialize."
+            ) from exc
+        return torch.device("cuda")
+
+    # --device=auto
+    if torch.cuda.is_available():
+        try:
+            torch.empty(1, device="cuda")
+            return torch.device("cuda")
+        except Exception as exc:
+            print(
+                "warning: CUDA was detected but failed to initialize; "
+                f"falling back to CPU ({exc})."
+            )
+    return torch.device("cpu")
+
+
 def _flatten_loader_batch(
     batch_x: torch.Tensor,
     batch_y: torch.Tensor,

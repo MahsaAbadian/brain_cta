@@ -36,19 +36,6 @@ This file tracks what is already done, what is currently underway, and what stil
 - Align local model selection with challenge-style full-case metrics.
 - Stabilize runtime (current large model is slow) without losing segmentation quality.
 
-## Immediate Next (Highest Priority)
-
-- Run challenge-like evaluation on current best checkpoints using `src/evaluate_challenge_like.py`.
-- Store per-experiment eval outputs in separate folders and compare the same checkpoint family.
-- Pick one primary selection metric for experiments:
-  - training-time: `val_mean_fg_dice` (present-only), and
-  - challenge-like: official TopBrain metrics (when package is available).
-- Build a short experiment tracker CSV with:
-  - checkpoint path
-  - loss weights/clamps
-  - patch/stride settings
-  - challenge-like metrics summary.
-
 ## Diagnosed Problems (from epoch 119 analysis)
 
 ### Metric reliability issues
