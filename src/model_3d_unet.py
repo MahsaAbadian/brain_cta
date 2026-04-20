@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class ConvBlock3D(nn.Module):
@@ -31,8 +32,20 @@ class UNet3D(nn.Module):
     Default channels: 16 -> 32 -> 64 -> 128 -> 256 (bottleneck).
     Uses InstanceNorm + LeakyReLU (stable with batch_size=1).
     """
-    def __init__(self, in_channels: int = 1, num_classes: int = 41, base_ch: int = 16):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        num_classes: int = 41,
+        base_ch: int = 16,
+        use_checkpoint: bool = False,
+    ):
         super().__init__()
+        # When enabled, encoder/decoder ConvBlocks are run via
+        # torch.utils.checkpoint: their forward activations are NOT stored for
+        # backward; instead the forward is re-run during backward to rebuild
+        # them. Trades ~25-35% extra compute per step for a large drop in peak
+        # activation memory. Results are bit-exact vs. non-checkpointed.
+        self.use_checkpoint = use_checkpoint
 
         # Encoder
         self.enc1 = ConvBlock3D(in_channels, base_ch)
@@ -76,31 +89,42 @@ class UNet3D(nn.Module):
             return x
         return F.interpolate(x, size=ref.shape[2:], mode="trilinear", align_corners=False)
 
+    def _run_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Run a ConvBlock3D with optional gradient checkpointing.
+
+        Checkpointing is only applied during training; at eval time we use the
+        standard forward so activation memory is already minimal and we avoid
+        recompute overhead.
+        """
+        if self.use_checkpoint and self.training:
+            return checkpoint(block, x, use_reentrant=False)
+        return block(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Encoder path
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e4 = self.enc4(self.pool3(e3))
+        e1 = self._run_block(self.enc1, x)
+        e2 = self._run_block(self.enc2, self.pool1(e1))
+        e3 = self._run_block(self.enc3, self.pool2(e2))
+        e4 = self._run_block(self.enc4, self.pool3(e3))
 
-        b = self.bottleneck(self.pool4(e4))
+        b = self._run_block(self.bottleneck, self.pool4(e4))
 
         # Decoder path mirrors the encoder and fuses skip features at each scale.
         d4 = self.up4(b)
         d4 = self._match_size(d4, e4)
-        d4 = self.dec4(torch.cat([d4, e4], dim=1))
+        d4 = self._run_block(self.dec4, torch.cat([d4, e4], dim=1))
 
         d3 = self.up3(d4)
         d3 = self._match_size(d3, e3)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d3 = self._run_block(self.dec3, torch.cat([d3, e3], dim=1))
 
         d2 = self.up2(d3)
         d2 = self._match_size(d2, e2)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d2 = self._run_block(self.dec2, torch.cat([d2, e2], dim=1))
 
         d1 = self.up1(d2)
         d1 = self._match_size(d1, e1)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        d1 = self._run_block(self.dec1, torch.cat([d1, e1], dim=1))
 
         logits = self.out_conv(d1)  # raw logits
         return logits

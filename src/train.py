@@ -308,6 +308,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help=(
+            "Enable gradient (activation) checkpointing on UNet encoder/decoder "
+            "blocks. Bit-exact equivalent of standard training, trades ~25-35%% "
+            "extra compute per step for a large drop in peak activation memory. "
+            "Useful when you want larger effective batch without AMP."
+        ),
+    )
+    parser.add_argument(
         "--amp-dtype",
         type=str,
         choices=("fp16", "bf16"),
@@ -640,7 +650,14 @@ def main() -> int:
                 "--enable-ce-class-weights is not set."
             )
 
-    model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
+    model = UNet3D(
+        in_channels=1,
+        num_classes=num_classes,
+        base_ch=args.base_ch,
+        use_checkpoint=bool(args.grad_checkpoint),
+    ).to(device)
+    if args.grad_checkpoint:
+        print("gradient checkpointing enabled on UNet encoder/decoder blocks")
     criterion = DiceCELoss(
         num_classes=num_classes,
         dice_weight=args.dice_weight,
