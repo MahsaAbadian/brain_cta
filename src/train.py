@@ -339,6 +339,39 @@ def parse_args() -> argparse.Namespace:
             "needed for dynamic range) on Ampere+ GPUs; 'fp16' is the default."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help=(
+            "Save a full (model+optimizer+scheduler+RNG+epoch) training "
+            "checkpoint every N epochs for resumability. 0 (default) disables "
+            "periodic checkpointing. Best-val weights are saved independently "
+            "whenever validation Dice improves."
+        ),
+    )
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=3,
+        help=(
+            "When --checkpoint-every > 0, retain this many most recent periodic "
+            "checkpoints and delete older ones. Best-val and final weights are "
+            "kept regardless."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a periodic checkpoint (.pt) produced by "
+            "--checkpoint-every. Resumes training with restored model, "
+            "optimizer, scheduler, GradScaler, and RNG state. Note: keep the "
+            "same --epochs (cosine schedule T_max) as the original run for "
+            "consistent LR decay."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -459,6 +492,96 @@ def _topbrain_csv_values(ran: bool, metrics: dict[str, float]) -> list[str]:
         value = metrics[key]
         values.append("" if not np.isfinite(value) else f"{value:.6f}")
     return values
+
+
+def _save_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: "torch.amp.GradScaler | None",
+    epoch: int,
+    best_val_dice: float,
+) -> None:
+    """Atomically write a full training checkpoint to `path`.
+
+    Captures everything needed to resume training bit-identically (modulo
+    non-deterministic CUDA kernels): model/optimizer/scheduler/scaler state,
+    best-val tracking, and RNG states for python/numpy/torch-CPU/torch-CUDA.
+    Writes to a .tmp file first and then renames to avoid leaving a corrupt
+    checkpoint if the process is killed mid-save.
+    """
+    state: dict = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": (
+            scaler.state_dict()
+            if (scaler is not None and scaler.is_enabled())
+            else None
+        ),
+        "best_val_dice": best_val_dice,
+        "rng_python": random.getstate(),
+        "rng_numpy": np.random.get_state(),
+        "rng_torch_cpu": torch.get_rng_state(),
+        "rng_torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, tmp_path)
+    tmp_path.replace(path)
+
+
+def _load_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: "torch.amp.GradScaler | None",
+    device: torch.device,
+) -> tuple[int, float]:
+    """Restore full training state from a checkpoint written by _save_checkpoint.
+
+    Returns (last_completed_epoch, best_val_dice). Caller should start the next
+    training epoch at `last_completed_epoch + 1`.
+    """
+    state = torch.load(str(path), map_location=device, weights_only=False)
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    if (
+        scaler is not None
+        and scaler.is_enabled()
+        and state.get("scaler") is not None
+    ):
+        scaler.load_state_dict(state["scaler"])
+    random.setstate(state["rng_python"])
+    np.random.set_state(state["rng_numpy"])
+    torch.set_rng_state(state["rng_torch_cpu"])
+    cuda_rng = state.get("rng_torch_cuda")
+    if torch.cuda.is_available() and cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
+    return int(state["epoch"]), float(state["best_val_dice"])
+
+
+def _rotate_periodic_checkpoints(out_dir: Path, keep: int) -> None:
+    """Delete periodic checkpoints beyond the `keep` most recent.
+
+    Only matches the `checkpoint_epoch*.pt` naming pattern, so best-val and
+    final weights (different filenames) are never touched.
+    """
+    if keep <= 0:
+        return
+    checkpoints = sorted(out_dir.glob("checkpoint_epoch*.pt"))
+    for old in checkpoints[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 def train_one_epoch(
@@ -745,26 +868,58 @@ def main() -> int:
         if topbrain_runtime and not topbrain_runtime.available:
             print(f"TopBrain disabled (import/runtime error): {topbrain_runtime.error_message}")
 
-    with metrics_csv.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "epoch",
-                "lr",
-                "train_loss",
-                "val_loss",
-                "val_mean_fg_dice",
-                "val_mean_fg_dice_all_cases_present",
-                *[f"val_dice_c{c:02d}" for c in range(num_classes)],
-                *_topbrain_csv_columns("tb_subset"),
-                *_topbrain_csv_columns("tb_full"),
-            ]
-        )
+    resuming = args.resume is not None
+    if resuming and not args.resume.is_file():
+        raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
+
+    # Only (re)write the CSV header if the file does not already contain rows.
+    # When resuming, we append so prior epoch history is preserved.
+    metrics_has_rows = metrics_csv.is_file() and metrics_csv.stat().st_size > 0
+    if not metrics_has_rows:
+        with metrics_csv.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "epoch",
+                    "lr",
+                    "train_loss",
+                    "val_loss",
+                    "val_mean_fg_dice",
+                    "val_mean_fg_dice_all_cases_present",
+                    *[f"val_dice_c{c:02d}" for c in range(num_classes)],
+                    *_topbrain_csv_columns("tb_subset"),
+                    *_topbrain_csv_columns("tb_full"),
+                ]
+            )
 
     best_val_dice = -1.0
+    start_epoch = 1
     final_weights_path = out_dir / "model_final_weights.pt"
+    best_weights_path = out_dir / "model_best_weights.pt"
 
-    for epoch in range(1, args.epochs + 1):
+    if resuming:
+        last_completed_epoch, best_val_dice = _load_checkpoint(
+            args.resume,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
+        )
+        start_epoch = last_completed_epoch + 1
+        print(
+            f"resumed from {args.resume}: "
+            f"last_completed_epoch={last_completed_epoch} "
+            f"best_val_dice={best_val_dice:.6f} "
+            f"next_epoch={start_epoch}"
+        )
+        if start_epoch > args.epochs:
+            print(
+                f"checkpoint is already past --epochs={args.epochs}; nothing "
+                "to train. Increase --epochs to continue training."
+            )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         run_topbrain_this_epoch = topbrain_enabled and args.topbrain_per_epoch
         run_topbrain_full = (
@@ -862,14 +1017,31 @@ def main() -> int:
                 ]
             )
 
-        if val_mean_fg_dice > best_val_dice:
+        improved_best = val_mean_fg_dice > best_val_dice
+        if improved_best:
             best_val_dice = val_mean_fg_dice
+            torch.save(model.state_dict(), best_weights_path)
+
+        if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+            ckpt_path = out_dir / f"checkpoint_epoch{epoch:04d}.pt"
+            _save_checkpoint(
+                ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_val_dice=best_val_dice,
+            )
+            _rotate_periodic_checkpoints(out_dir, args.keep_last_checkpoints)
 
         elapsed = time.time() - epoch_start
+        best_tag = " [new best]" if improved_best else ""
         print(
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
             f"lr={lr:.2e} train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f} "
+            f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f}"
+            f"{best_tag} "
             "val_mean_fg_dice_all_cases_present="
             f"{val_mean_fg_dice_all_cases_present:.6f} "
             f"time={elapsed:.1f}s"
@@ -962,6 +1134,8 @@ def main() -> int:
     print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
     print(f"Saved metrics: {metrics_csv}")
     print(f"Saved final weights: {final_weights_path}")
+    if best_weights_path.is_file():
+        print(f"Saved best-val weights: {best_weights_path}")
     return 0
 
 
