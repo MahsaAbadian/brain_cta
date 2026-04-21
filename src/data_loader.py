@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Patch-based dataset and dataloader utilities for training on preprocessed data."""
 
+import json
 import random
 from pathlib import Path
 from typing import Callable, Sequence
@@ -17,6 +18,39 @@ from data_utils import (
     split_and_save,
     read_num_classes_from_labelmap,
 )
+
+
+def load_fold_from_splits_json(
+    splits_json: Path, fold: int
+) -> tuple[list[str], list[str]]:
+    """Load a single fold from an nnUNet-style splits_final.json.
+
+    The file must be a JSON list of ``{"train": [...], "val": [...]}`` dicts.
+    Returns sorted, deduplicated train/val id lists. Validates disjointness.
+    """
+    if not splits_json.is_file():
+        raise FileNotFoundError(f"splits_json not found: {splits_json}")
+    folds = json.loads(splits_json.read_text())
+    if not isinstance(folds, list) or not folds:
+        raise ValueError(f"splits_json is empty or not a list: {splits_json}")
+    if fold < 0 or fold >= len(folds):
+        raise IndexError(
+            f"Requested fold {fold} is out of range; splits file has "
+            f"{len(folds)} folds ({splits_json})."
+        )
+    entry = folds[fold]
+    if not isinstance(entry, dict) or set(entry) != {"train", "val"}:
+        raise ValueError(
+            f"Fold {fold} in {splits_json} must be a dict with keys 'train' and 'val'."
+        )
+    train_ids = sorted({cid for cid in entry["train"] if cid})
+    val_ids = sorted({cid for cid in entry["val"] if cid})
+    overlap = set(train_ids) & set(val_ids)
+    if overlap:
+        raise ValueError(
+            f"Fold {fold} has overlapping case ids: {sorted(overlap)}"
+        )
+    return train_ids, val_ids
 
 
 def random_flip_3d(img: np.ndarray, lbl: np.ndarray, p: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
@@ -348,16 +382,30 @@ def build_train_val_loaders(
     rare_class_patch_prob: float = 0.35,
     rare_class_weight_max: float = 4.0,
     target_skeleton_dir: Path | None = None,
+    splits_json: Path | None = None,
+    fold: int = 0,
 ) -> tuple[CTAPatchDataset, list[str], DataLoader, int]:
     """
     Build CTA train dataset + loader and return validation case IDs.
     Reuses split + preprocessing utilities from data_utils.py.
+
+    Split resolution order:
+      1. If ``splits_json`` is given and exists: use fold ``fold`` from that JSON.
+      2. Else if ``split_dir`` has a ``splits_final.json``: use fold ``fold``
+         from it.
+      3. Else if ``train_cases.txt`` / ``val_cases.txt`` exist: use them
+         (legacy single-fold mode).
+      4. Else: run a ratio split on every case found in ``image_dir``/``label_dir``.
     """
     split_dir.mkdir(parents=True, exist_ok=True)
 
+    candidate_json = splits_json if splits_json is not None else split_dir / "splits_final.json"
     train_split = split_dir / "train_cases.txt"
     val_split = split_dir / "val_cases.txt"
-    if train_split.is_file() and val_split.is_file():
+
+    if candidate_json is not None and candidate_json.is_file():
+        train_ids, val_ids = load_fold_from_splits_json(candidate_json, fold=fold)
+    elif train_split.is_file() and val_split.is_file():
         train_ids, val_ids = load_split_ids(split_dir)
         # Safety: dedupe possibly duplicated IDs from older split generation.
         train_ids = sorted(set(train_ids))

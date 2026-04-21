@@ -12,7 +12,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Copy nnUNet predictions and matching GT labels into the same folder layout "
-            "used by src/evaluate_challenge_like.py."
+            "used by src/evaluate_challenge_like.py. Single-fold export; for K-fold "
+            "stitching use scripts/eval_oof.py instead."
         )
     )
     parser.add_argument(
@@ -22,10 +23,28 @@ def parse_args() -> argparse.Namespace:
         help="Directory produced by nnUNetv2_predict.",
     )
     parser.add_argument(
+        "--splits-json",
+        type=Path,
+        default=Path("training_data_resampled/split/splits_final.json"),
+        help=(
+            "Canonical K-fold splits file. When present and --fold is set, the "
+            "val list of that fold is exported. Falls back to --split-dir."
+        ),
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="Fold index read from --splits-json (ignored in legacy mode).",
+    )
+    parser.add_argument(
         "--split-dir",
         type=Path,
         default=Path("training_data_resampled/split"),
-        help="Directory containing val_cases.txt.",
+        help=(
+            "Legacy directory with val_cases.txt; only used if --splits-json is "
+            "missing."
+        ),
     )
     parser.add_argument(
         "--label-dir",
@@ -53,12 +72,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_val_ids(split_dir: Path) -> list[str]:
+def _load_val_ids(
+    splits_json: Path | None, split_dir: Path, fold: int
+) -> list[str]:
+    import json
+
+    if splits_json is not None and splits_json.is_file():
+        folds = json.loads(splits_json.read_text())
+        if fold < 0 or fold >= len(folds):
+            raise IndexError(
+                f"Fold {fold} out of range for {splits_json} ({len(folds)} folds)."
+            )
+        val_ids = sorted({cid for cid in folds[fold]["val"] if cid})
+        if not val_ids:
+            raise RuntimeError(
+                f"Fold {fold} in {splits_json} has an empty val list."
+            )
+        return val_ids
+
     val_path = split_dir / "val_cases.txt"
     if not val_path.is_file():
-        raise FileNotFoundError(f"Missing val split file: {val_path}")
-    val_ids = [x.strip() for x in val_path.read_text().splitlines() if x.strip()]
-    val_ids = sorted(set(val_ids))
+        raise FileNotFoundError(
+            f"Missing splits_json ({splits_json}) and legacy val file ({val_path})."
+        )
+    val_ids = sorted({x.strip() for x in val_path.read_text().splitlines() if x.strip()})
     if not val_ids:
         raise RuntimeError(f"No validation ids found in {val_path}")
     return val_ids
@@ -112,7 +149,7 @@ def _run_topbrain_eval(
 
 def main() -> int:
     args = parse_args()
-    val_ids = _load_val_ids(args.split_dir)
+    val_ids = _load_val_ids(args.splits_json, args.split_dir, args.fold)
     out_pred_dir = args.out_dir / "predictions"
     out_gt_dir = args.out_dir / "ground-truth"
     out_pred_dir.mkdir(parents=True, exist_ok=True)

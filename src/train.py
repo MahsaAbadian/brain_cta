@@ -163,6 +163,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/baseline"))
     parser.add_argument(
+        "--splits-json",
+        type=Path,
+        default=Path("training_data_resampled/split/splits_final.json"),
+        help=(
+            "Canonical K-fold splits file (nnUNet format). When the file "
+            "exists, the requested --fold is used. Falls back to legacy "
+            "train_cases.txt/val_cases.txt when this file is missing."
+        ),
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="Fold index into --splits-json (ignored in legacy mode).",
+    )
+    parser.add_argument(
+        "--fold-subdir",
+        action="store_true",
+        help=(
+            "If set, training artifacts go under <out-dir>/fold_<fold> instead "
+            "of <out-dir>. Recommended when sweeping all folds into one parent "
+            "run directory."
+        ),
+    )
+    parser.add_argument(
         "--overfit-case-id",
         type=str,
         default=None,
@@ -746,6 +771,8 @@ def main() -> int:
     print(f"device={device}")
 
     out_dir: Path = args.out_dir
+    if args.fold_subdir:
+        out_dir = out_dir / f"fold_{args.fold}"
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_csv = out_dir / "metrics.csv"
     wandb_run = None
@@ -810,8 +837,15 @@ def main() -> int:
             rare_class_patch_prob=args.rare_class_patch_prob,
             rare_class_weight_max=args.rare_class_weight_max,
             target_skeleton_dir=target_skeleton_dir,
+            splits_json=args.splits_json,
+            fold=args.fold,
         )
         train_case_ids = train_ds.case_ids
+        if args.splits_json is not None and args.splits_json.is_file():
+            print(
+                f"splits: {args.splits_json} fold={args.fold} "
+                f"train={len(train_case_ids)} val={len(val_case_ids)}"
+            )
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
         f"val_stride={val_stride} train_batches={len(train_loader)} val_cases={len(val_case_ids)}"
