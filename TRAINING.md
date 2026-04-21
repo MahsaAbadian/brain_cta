@@ -36,6 +36,67 @@ If you hit GPU OOM with the default 128³ patches, reduce patches per volume fir
 .venv/bin/python src/train.py --epochs 10 --num-patches-per-volume 1 --out-dir runs/baseline_exp1
 ```
 
+## Weights & Biases (W&B) Logging
+
+`src/train.py` supports optional W&B tracking for run config, epoch metrics, and model artifacts.
+
+### One-time setup
+
+```bash
+.venv/bin/pip install wandb
+.venv/bin/wandb login
+```
+
+For remote jobs, set your API key in the job environment:
+
+```bash
+export WANDB_API_KEY=...
+```
+
+### CLI flags
+
+- `--wandb`: enable W&B logging
+- `--wandb-project`: W&B project name (default: `topbrain`)
+- `--wandb-entity`: optional W&B entity/team
+- `--wandb-run-name`: optional run display name
+- `--wandb-tags`: comma-separated tags, e.g. `ps128,cldice,ablationA`
+
+### Online example
+
+```bash
+.venv/bin/python src/train.py \
+  --epochs 10 \
+  --out-dir runs/wandb_baseline_exp1 \
+  --wandb \
+  --wandb-entity mahsa-abadian-brigham-and-women-s-hospital \
+  --wandb-project my-awesome-project \
+  --wandb-run-name baseline_ps128_np2 \
+  --wandb-tags baseline,ps128,cldice
+```
+
+### Offline mode (for unstable/no internet)
+
+```bash
+WANDB_MODE=offline .venv/bin/python src/train.py --wandb --out-dir runs/wandb_offline_exp1
+```
+
+Sync later:
+
+```bash
+wandb sync wandb/offline-run-*
+```
+
+### What gets logged
+
+- Full argparse config from the run
+- Per-epoch metrics: `train_loss`, `val_loss`, `val_mean_fg_dice`, `val_mean_fg_dice_all_cases_present`, `lr`
+- Per-class Dice metrics: `val_dice_c00...`
+- TopBrain metrics when enabled in training
+- End-of-run artifact with:
+  - `model_best_weights.pt`
+  - `model_final_weights.pt`
+  - `metrics.csv`
+
 ## Training Loop Overview
 
 `src/train.py` performs:

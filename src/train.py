@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import random
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+try:
+    import wandb  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    wandb = None
 
 from data_loader import (
     CTAPatchDataset,
@@ -372,7 +379,52 @@ def parse_args() -> argparse.Namespace:
             "consistent LR decay."
         ),
     )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases run logging.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="topbrain",
+        help="W&B project name when --wandb is enabled.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity/team name when --wandb is enabled.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional W&B run name override.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        type=str,
+        default="",
+        help="Optional comma-separated W&B tags, e.g. 'ps128,cldice,ablationA'.",
+    )
     return parser.parse_args()
+
+
+def _parse_wandb_tags(raw: str) -> list[str]:
+    return [tag.strip() for tag in raw.split(",") if tag.strip()]
+
+
+def _wandb_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    cfg: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            cfg[key] = str(value)
+        elif isinstance(value, tuple):
+            cfg[key] = list(value)
+        else:
+            cfg[key] = value
+    return cfg
 
 
 def compute_class_weights(
@@ -696,6 +748,30 @@ def main() -> int:
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_csv = out_dir / "metrics.csv"
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise ImportError(
+                "W&B logging requested with --wandb, but 'wandb' is not installed. "
+                "Install it with: .venv/bin/pip install wandb"
+            )
+        wandb_run = wandb.init(
+            entity=args.wandb_entity,
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            tags=_parse_wandb_tags(args.wandb_tags),
+            config=_wandb_config_from_args(args),
+            job_type="train",
+            dir=str(out_dir),
+        )
+        wandb_run.config.update({"resolved_device": str(device)}, allow_val_change=True)
+        print(
+            "W&B enabled: "
+            f"entity={args.wandb_entity} project={args.wandb_project} "
+            f"name={args.wandb_run_name} mode={os.environ.get('WANDB_MODE', 'online')}"
+        )
+        if os.environ.get("WANDB_MODE", "").lower() == "offline":
+            print("W&B offline mode active. Sync later with: wandb sync wandb/offline-run-*")
 
     patch_size = tuple(int(x) for x in args.patch_size)
     val_stride = (
@@ -1021,6 +1097,9 @@ def main() -> int:
         if improved_best:
             best_val_dice = val_mean_fg_dice
             torch.save(model.state_dict(), best_weights_path)
+            if wandb_run is not None:
+                wandb_run.summary["best_val_mean_fg_dice"] = float(best_val_dice)
+                wandb_run.summary["best_epoch"] = int(epoch)
 
         if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
             ckpt_path = out_dir / f"checkpoint_epoch{epoch:04d}.pt"
@@ -1072,6 +1151,43 @@ def main() -> int:
                     f"nb_err={full_metrics['clsavg_invalid_neighbors']:.4f} "
                     f"f1={full_metrics['sideroad_f1']:.4f}"
                 )
+
+        if wandb_run is not None:
+            log_payload: dict[str, float | int] = {
+                "epoch": int(epoch),
+                "lr": float(lr),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "val_mean_fg_dice": float(val_mean_fg_dice),
+            }
+            if np.isfinite(val_mean_fg_dice_all_cases_present):
+                log_payload["val_mean_fg_dice_all_cases_present"] = float(
+                    val_mean_fg_dice_all_cases_present
+                )
+            for idx, d in enumerate(per_class_dice):
+                log_payload[f"val_dice_c{idx:02d}"] = float(d)
+
+            if run_topbrain_this_epoch:
+                log_payload["tb_subset_ran"] = 1
+                log_payload["tb_subset_num_cases"] = int(subset_metrics["num_cases"])
+                for key in TOPBRAIN_METRIC_KEYS:
+                    value = subset_metrics[key]
+                    if np.isfinite(value):
+                        log_payload[f"tb_subset_{key}"] = float(value)
+            else:
+                log_payload["tb_subset_ran"] = 0
+
+            if run_topbrain_full:
+                log_payload["tb_full_ran"] = 1
+                log_payload["tb_full_num_cases"] = int(full_metrics["num_cases"])
+                for key in TOPBRAIN_METRIC_KEYS:
+                    value = full_metrics[key]
+                    if np.isfinite(value):
+                        log_payload[f"tb_full_{key}"] = float(value)
+            else:
+                log_payload["tb_full_ran"] = 0
+
+            wandb_run.log(log_payload, step=epoch)
 
     final_epoch_ran_topbrain_full = (
         topbrain_enabled
@@ -1131,6 +1247,15 @@ def main() -> int:
         )
 
     torch.save(model.state_dict(), final_weights_path)
+    if wandb_run is not None:
+        wandb_run.summary["best_val_mean_fg_dice"] = float(best_val_dice)
+        artifact_name = f"{out_dir.name}-{wandb_run.id}-artifacts"
+        artifact = wandb.Artifact(name=artifact_name, type="training_outputs")
+        for path in (best_weights_path, final_weights_path, metrics_csv):
+            if path.is_file():
+                artifact.add_file(str(path), name=path.name)
+        wandb_run.log_artifact(artifact)
+        wandb_run.finish()
     print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
     print(f"Saved metrics: {metrics_csv}")
     print(f"Saved final weights: {final_weights_path}")
