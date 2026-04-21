@@ -331,6 +331,7 @@ This section discusses common U-Net variants that could replace or extend the cu
   - Less educational if goal is to learn implementation details deeply.
   - Less control over every internal choice.
 - **Recommendation**: Excellent benchmarking reference, even if final training remains custom.
+- **Current repo status**: A separate official `nnunetv2` pipeline is available; see `NNUNET.md` for commands and folder conventions.
 
 ### E) 2D U-Net or 2.5D U-Net
 - **What changes**: Train slice-wise (2D) or multi-slice pseudo-3D inputs.
