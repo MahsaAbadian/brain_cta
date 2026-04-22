@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Literal, Sequence
 
 import nibabel as nib
 import numpy as np
@@ -188,36 +188,62 @@ def compute_rare_class_sampling_weights(
     case_ids: Sequence[str],
     num_classes: int,
     max_weight: float = 4.0,
+    mode: Literal["presence", "voxel", "hybrid"] = "hybrid",
 ) -> np.ndarray:
-    """Compute patient-level inverse presence weights for foreground classes.
+    """Compute rare-class sampling weights for foreground classes.
 
-    Weight idea:
-      weight[c] ~ 1 / presence_rate[c]
-    where presence_rate[c] is the fraction of train cases where class c appears.
-    We then normalize foreground weights to have mean 1.0 and clamp by max_weight.
+    Modes:
+      - presence: inverse patient-level class presence rate.
+      - voxel: inverse sqrt of total voxel frequency across train labels.
+      - hybrid: geometric mean of presence and voxel weights.
+
+    Foreground weights are normalized to mean 1 and clipped to [0.1, max_weight].
     """
     if max_weight <= 0:
         raise ValueError(f"max_weight must be > 0, got {max_weight}")
+    if mode not in {"presence", "voxel", "hybrid"}:
+        raise ValueError(f"Unknown rare class mode: {mode}")
 
     if len(case_ids) == 0:
         return np.ones(num_classes, dtype=np.float32)
 
     present_counts = np.zeros(num_classes, dtype=np.float64)
+    voxel_counts = np.zeros(num_classes, dtype=np.float64)
     for cid in case_ids:
         lbl_path = label_dir / f"{cid}.nii.gz"
         lbl = np.asanyarray(nib.load(str(lbl_path)).dataobj).astype(np.int64)
         present_classes = np.unique(lbl)
         present_classes = present_classes[(present_classes >= 0) & (present_classes < num_classes)]
         present_counts[present_classes] += 1
+        vals, counts = np.unique(lbl, return_counts=True)
+        vals = vals.astype(np.int64)
+        valid = (vals >= 0) & (vals < num_classes)
+        voxel_counts[vals[valid]] += counts[valid]
 
     n_cases = float(len(case_ids))
     rates = present_counts / n_cases
-    weights = np.ones(num_classes, dtype=np.float64)
+    presence_weights = np.ones(num_classes, dtype=np.float64)
     for c in range(1, num_classes):
         if rates[c] > 0:
-            weights[c] = 1.0 / rates[c]
+            presence_weights[c] = 1.0 / rates[c]
         else:
-            weights[c] = max_weight
+            presence_weights[c] = max_weight
+
+    voxel_weights = np.ones(num_classes, dtype=np.float64)
+    total_voxels = float(voxel_counts.sum())
+    voxel_freq = voxel_counts / max(total_voxels, 1.0)
+    for c in range(1, num_classes):
+        if voxel_freq[c] > 0:
+            voxel_weights[c] = 1.0 / np.sqrt(voxel_freq[c])
+        else:
+            voxel_weights[c] = max_weight
+
+    if mode == "presence":
+        weights = presence_weights
+    elif mode == "voxel":
+        weights = voxel_weights
+    else:
+        weights = np.sqrt(np.maximum(presence_weights * voxel_weights, 1e-12))
 
     fg = weights[1:]
     if fg.size > 0 and fg.mean() > 0:
@@ -381,6 +407,7 @@ def build_train_val_loaders(
     num_workers: int = 0,
     rare_class_patch_prob: float = 0.35,
     rare_class_weight_max: float = 4.0,
+    rare_class_mode: Literal["presence", "voxel", "hybrid"] = "hybrid",
     target_skeleton_dir: Path | None = None,
     splits_json: Path | None = None,
     fold: int = 0,
@@ -437,6 +464,7 @@ def build_train_val_loaders(
         case_ids=train_ids,
         num_classes=num_classes,
         max_weight=rare_class_weight_max,
+        mode=rare_class_mode,
     )
 
     train_ds = CTAPatchDataset(

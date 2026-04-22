@@ -131,7 +131,7 @@ Loss class: `DiceCELoss` in `src/train.py`.
 
 Final objective:
 
-- `total_loss = ce_weight * CE + dice_weight * DiceLoss`
+- `total_loss = ce_weight * CE + dice_weight * DiceLoss + tversky_weight * TverskyLoss + cldice_weight * clDiceLoss`
 
 ### 1) Multiclass Cross Entropy (CE)
 
@@ -185,6 +185,9 @@ Dice loss is:
 
 - `--ce-weight`: scales CE term
 - `--dice-weight`: scales Dice term
+- `--tversky-weight`: scales Tversky/Focal-Tversky term
+- `--tversky-alpha`, `--tversky-beta`: Tversky FN/FP penalties
+- `--tversky-gamma`: focal exponent (`1.0` = plain Tversky)
 - `--cldice-weight`: scales clDice term (`0` disables clDice)
 - `--cldice-iters`: soft-skeletonization iterations used by clDice
 - `--enable-ce-class-weights`: enables inverse-sqrt CE class weights
@@ -194,6 +197,7 @@ Current default behavior in `src/train.py`:
 
 - `ce_weight = 1.0`
 - `dice_weight = 1.0`
+- `tversky_weight = 1.0` with `alpha=0.3`, `beta=0.7`, `gamma=1.0`
 - `cldice_weight = 1.0` (clDice enabled by default)
 - `include_background = False` (Dice term ignores class `0`)
 - CE class weighting is disabled by default (unweighted CE unless `--enable-ce-class-weights` is set)
@@ -261,6 +265,29 @@ This can inflate means when many classes are absent.
 - `--ce-weight-max` (default: none): maximum clamp for class weights (only when enabled).
 - `--rare-class-patch-prob` (default: `0.35`): probability of sampling train patch centers from rare present classes.
 - `--rare-class-weight-max` (default: `4.0`): cap for patient-presence inverse weights used by rare-class sampling.
+- `--rare-class-mode` (default: `hybrid`): rare-class weighting mode for sampling (`presence`, `voxel`, `hybrid`).
+
+## Thin-vessel Phase-1 Preset
+
+Use this preset when thin vessel classes collapse to background late in training:
+
+```bash
+.venv/bin/python src/train.py \
+  --epochs 200 \
+  --patch-size 128 128 128 \
+  --num-patches-per-volume 2 \
+  --cldice-weight 2.0 \
+  --cldice-iters 12 \
+  --tversky-weight 1.0 \
+  --tversky-alpha 0.3 \
+  --tversky-beta 0.7 \
+  --tversky-gamma 1.0 \
+  --enable-ce-class-weights \
+  --ce-weight-max 8 \
+  --rare-class-mode hybrid \
+  --rare-class-patch-prob 0.5 \
+  --out-dir runs/phase1_thin_vessel
+```
 
 ## Scheduler and Optimizer
 

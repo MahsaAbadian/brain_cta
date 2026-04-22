@@ -14,6 +14,10 @@ class DiceCELoss(nn.Module):
         num_classes: int,
         dice_weight: float = 1.0,
         ce_weight: float = 1.0,
+        tversky_weight: float = 0.0,
+        tversky_alpha: float = 0.3,
+        tversky_beta: float = 0.7,
+        tversky_gamma: float = 1.0,
         cldice_weight: float = 0.0,
         cldice_iters: int = 12,
         cldice_class_ids: tuple[int, ...] | None = None,
@@ -26,11 +30,25 @@ class DiceCELoss(nn.Module):
         self.num_classes = num_classes
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
+        self.tversky_weight = tversky_weight
+        self.tversky_alpha = tversky_alpha
+        self.tversky_beta = tversky_beta
+        self.tversky_gamma = tversky_gamma
         self.cldice_weight = cldice_weight
         self.cldice_iters = cldice_iters
         self.cldice_class_ids = cldice_class_ids
         self.include_background = include_background
         self.eps = eps
+        if tversky_alpha < 0.0 or tversky_beta < 0.0:
+            raise ValueError(
+                f"tversky_alpha and tversky_beta must be >= 0; got {tversky_alpha}, {tversky_beta}"
+            )
+        if tversky_alpha + tversky_beta <= 0.0:
+            raise ValueError(
+                "tversky_alpha + tversky_beta must be > 0 for a valid denominator."
+            )
+        if tversky_gamma <= 0.0:
+            raise ValueError(f"tversky_gamma must be > 0, got {tversky_gamma}")
         # cldice_channel_chunk:
         #   0  -> process all clDice channels at once (legacy behavior).
         #   >0 -> process at most this many channels per skeletonize call,
@@ -205,6 +223,17 @@ class DiceCELoss(nn.Module):
         cldice_score = (2.0 * tprec * tsens) / (tprec + tsens + self.eps)
         return 1.0 - cldice_score.mean()
 
+    def _tversky_loss(self, probs: torch.Tensor, target_1h: torch.Tensor) -> torch.Tensor:
+        dims = (0, 2, 3, 4)
+        probs = probs.float()
+        target_1h = target_1h.float()
+        tp = (probs * target_1h).sum(dims)
+        fn = ((1.0 - probs) * target_1h).sum(dims)
+        fp = (probs * (1.0 - target_1h)).sum(dims)
+        denom = tp + self.tversky_alpha * fn + self.tversky_beta * fp
+        tversky = (tp + self.eps) / (denom + self.eps)
+        return torch.pow(1.0 - tversky, self.tversky_gamma).mean()
+
     def forward(
         self,
         logits: torch.Tensor,
@@ -227,6 +256,11 @@ class DiceCELoss(nn.Module):
         denom = probs.sum(dims) + target_1h.sum(dims)
         dice = (2.0 * inter + self.eps) / (denom + self.eps)
         dice_loss = 1.0 - dice.mean()
+        tversky_loss = (
+            self._tversky_loss(probs, target_1h)
+            if self.tversky_weight > 0.0
+            else torch.zeros((), dtype=logits.dtype, device=logits.device)
+        )
         cldice_loss = (
             self._cldice_loss(probs, target_1h, target_skel=target_skel)
             if self.cldice_weight > 0.0
@@ -236,5 +270,6 @@ class DiceCELoss(nn.Module):
         return (
             self.ce_weight * ce_loss
             + self.dice_weight * dice_loss
+            + self.tversky_weight * tversky_loss
             + self.cldice_weight * cldice_loss
         )

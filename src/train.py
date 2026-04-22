@@ -8,7 +8,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -51,6 +51,15 @@ def _parse_class_id_list(raw: str | None) -> tuple[int, ...] | None:
             f"Invalid --cldice-class-ids='{raw}'. Expected comma-separated integers."
         ) from exc
     return tuple(sorted(set(values)))
+
+
+def _parse_rare_class_mode(raw: str) -> Literal["presence", "voxel", "hybrid"]:
+    mode = raw.strip().lower()
+    if mode not in {"presence", "voxel", "hybrid"}:
+        raise ValueError(
+            f"Invalid --rare-class-mode='{raw}'. Expected one of: presence, voxel, hybrid."
+        )
+    return mode  # type: ignore[return-value]
 
 
 def _resolve_expected_cldice_class_ids(
@@ -217,6 +226,30 @@ def parse_args() -> argparse.Namespace:
         help="Weight for CE term inside DiceCELoss.",
     )
     parser.add_argument(
+        "--tversky-weight",
+        type=float,
+        default=1.0,
+        help="Weight for Tversky/Focal-Tversky term inside DiceCELoss.",
+    )
+    parser.add_argument(
+        "--tversky-alpha",
+        type=float,
+        default=0.3,
+        help="Tversky FN penalty weight (higher penalizes missed positives more).",
+    )
+    parser.add_argument(
+        "--tversky-beta",
+        type=float,
+        default=0.7,
+        help="Tversky FP penalty weight (higher penalizes false positives more).",
+    )
+    parser.add_argument(
+        "--tversky-gamma",
+        type=float,
+        default=1.0,
+        help="Focal exponent for Tversky term (1.0 = plain Tversky).",
+    )
+    parser.add_argument(
         "--cldice-weight",
         type=float,
         default=1.0,
@@ -294,6 +327,18 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Maximum patient-presence inverse weight used for rare-class patch "
             "sampling. Higher increases focus on sparse classes."
+        ),
+    )
+    parser.add_argument(
+        "--rare-class-mode",
+        type=str,
+        choices=("presence", "voxel", "hybrid"),
+        default="hybrid",
+        help=(
+            "Rare-class weighting mode for patch-center sampling: "
+            "'presence' (inverse patient presence), "
+            "'voxel' (inverse sqrt voxel frequency), "
+            "'hybrid' (geometric mean of both)."
         ),
     )
     parser.add_argument(
@@ -715,6 +760,7 @@ def _build_overfit_loaders(
     disable_augment: bool,
     rare_class_patch_prob: float,
     rare_class_weight_max: float,
+    rare_class_mode: Literal["presence", "voxel", "hybrid"],
     target_skeleton_dir: Path | None,
 ) -> tuple[DataLoader, int]:
     image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
@@ -735,6 +781,7 @@ def _build_overfit_loaders(
         case_ids=[case_id],
         num_classes=num_classes,
         max_weight=rare_class_weight_max,
+        mode=rare_class_mode,
     )
     train_ds = CTAPatchDataset(
         case_ids=[case_id],
@@ -761,6 +808,7 @@ def _build_overfit_loaders(
 def main() -> int:
     args = parse_args()
     cldice_class_ids = _parse_class_id_list(args.cldice_class_ids)
+    rare_class_mode = _parse_rare_class_mode(args.rare_class_mode)
     target_skeleton_dir = args.cldice_target_skeleton_dir
     if target_skeleton_dir is not None and not target_skeleton_dir.is_dir():
         raise FileNotFoundError(
@@ -819,6 +867,7 @@ def main() -> int:
             disable_augment=args.overfit_disable_augment,
             rare_class_patch_prob=args.rare_class_patch_prob,
             rare_class_weight_max=args.rare_class_weight_max,
+            rare_class_mode=rare_class_mode,
             target_skeleton_dir=target_skeleton_dir,
         )
         train_case_ids = [args.overfit_case_id]
@@ -836,6 +885,7 @@ def main() -> int:
             num_workers=args.num_workers,
             rare_class_patch_prob=args.rare_class_patch_prob,
             rare_class_weight_max=args.rare_class_weight_max,
+            rare_class_mode=rare_class_mode,
             target_skeleton_dir=target_skeleton_dir,
             splits_json=args.splits_json,
             fold=args.fold,
@@ -853,13 +903,24 @@ def main() -> int:
     print(
         "rare-class sampling: "
         f"prob={args.rare_class_patch_prob:.2f} "
-        f"max_weight={args.rare_class_weight_max:.2f}"
+        f"max_weight={args.rare_class_weight_max:.2f} "
+        f"mode={rare_class_mode}"
     )
 
     if args.topbrain_eval_every_n_epochs <= 0:
         raise ValueError("--topbrain-eval-every-n-epochs must be >= 1")
     if args.cldice_weight < 0:
         raise ValueError("--cldice-weight must be >= 0")
+    if args.tversky_weight < 0:
+        raise ValueError("--tversky-weight must be >= 0")
+    if args.tversky_alpha < 0:
+        raise ValueError("--tversky-alpha must be >= 0")
+    if args.tversky_beta < 0:
+        raise ValueError("--tversky-beta must be >= 0")
+    if args.tversky_alpha + args.tversky_beta <= 0:
+        raise ValueError("--tversky-alpha + --tversky-beta must be > 0")
+    if args.tversky_gamma <= 0:
+        raise ValueError("--tversky-gamma must be > 0")
     if args.cldice_iters < 0:
         raise ValueError("--cldice-iters must be >= 0")
     if args.topbrain_subset_size < 0:
@@ -907,6 +968,10 @@ def main() -> int:
         num_classes=num_classes,
         dice_weight=args.dice_weight,
         ce_weight=args.ce_weight,
+        tversky_weight=args.tversky_weight,
+        tversky_alpha=args.tversky_alpha,
+        tversky_beta=args.tversky_beta,
+        tversky_gamma=args.tversky_gamma,
         cldice_weight=args.cldice_weight,
         cldice_iters=args.cldice_iters,
         cldice_class_ids=cldice_class_ids,
@@ -928,6 +993,8 @@ def main() -> int:
     print(
         "loss weights: "
         f"ce={args.ce_weight:.3f} dice={args.dice_weight:.3f} "
+        f"tversky={args.tversky_weight:.3f} "
+        f"(alpha={args.tversky_alpha:.3f}, beta={args.tversky_beta:.3f}, gamma={args.tversky_gamma:.3f}) "
         f"cldice={args.cldice_weight:.3f} cldice_iters={args.cldice_iters} "
         f"cldice_class_ids={cldice_class_ids} "
         f"cldice_channel_chunk={args.cldice_channel_chunk} "
