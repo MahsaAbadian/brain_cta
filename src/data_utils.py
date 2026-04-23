@@ -90,6 +90,56 @@ def read_num_classes_from_labelmap(labelmap_path: Path) -> int:
     return max_idx + 1
 
 
+def read_class_names_from_labelmap(
+    labelmap_path: Path, num_classes: int | None = None
+) -> list[str]:
+    """Read ITK-SNAP label map and return a ``list[str]`` of class names.
+
+    ITK-SNAP label lines look like::
+
+        0  0 0 0  0 0 0  "Clear Label"
+        1  255 0 182  1 1 1  "BA"
+
+    We take the trailing quoted string as the display name. If ``num_classes``
+    is given, the returned list is padded with ``"class_<idx>"`` placeholders
+    for indices that are missing from the file. If the file cannot be read we
+    return generic ``"class_<idx>"`` names so callers never crash on logging.
+    """
+    names: dict[int, str] = {}
+    try:
+        text = labelmap_path.read_text()
+    except OSError:
+        text = ""
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        first_token = line.split()[0]
+        try:
+            idx = int(first_token)
+        except ValueError:
+            continue
+        # Try to recover a quoted label description; fall back to any trailing
+        # non-numeric token if quotes are missing.
+        label: str | None = None
+        if '"' in line:
+            start = line.index('"') + 1
+            end = line.rindex('"')
+            if end > start:
+                label = line[start:end].strip()
+        if not label:
+            label = f"class_{idx}"
+        names[idx] = label
+
+    if num_classes is None:
+        if not names:
+            return []
+        num_classes = max(names) + 1
+
+    return [names.get(c, f"class_{c}") for c in range(num_classes)]
+
+
 def random_crop_3d(
     image: np.ndarray, label: np.ndarray, patch_size: tuple[int, int, int]
 ) -> tuple[np.ndarray, np.ndarray]:

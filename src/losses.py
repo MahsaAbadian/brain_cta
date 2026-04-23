@@ -234,12 +234,34 @@ class DiceCELoss(nn.Module):
         tversky = (tp + self.eps) / (denom + self.eps)
         return torch.pow(1.0 - tversky, self.tversky_gamma).mean()
 
+    # Names of the individual loss components exposed by forward_components.
+    # Ordered so callers can iterate deterministically.
+    COMPONENT_NAMES: tuple[str, ...] = ("ce", "dice", "tversky", "cldice")
+
     def forward(
         self,
         logits: torch.Tensor,
         target: torch.Tensor,
         target_skel: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        total, _ = self.forward_components(logits, target, target_skel=target_skel)
+        return total
+
+    def forward_components(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        target_skel: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute the aggregate loss and return the per-component values.
+
+        Returns:
+            total: Scalar weighted sum used as the optimization target.
+            components: Dict with ``ce``, ``dice``, ``tversky``, ``cldice`` keys
+                holding the *unweighted* per-term loss values. Callers can
+                multiply by the stored weights if needed, or log them as-is to
+                observe how each term evolves independently of its weight.
+        """
         ce_loss = self.ce(logits, target)
 
         probs = torch.softmax(logits, dim=1)
@@ -267,9 +289,16 @@ class DiceCELoss(nn.Module):
             else torch.zeros((), dtype=logits.dtype, device=logits.device)
         )
 
-        return (
+        total = (
             self.ce_weight * ce_loss
             + self.dice_weight * dice_loss
             + self.tversky_weight * tversky_loss
             + self.cldice_weight * cldice_loss
         )
+        components = {
+            "ce": ce_loss,
+            "dice": dice_loss,
+            "tversky": tversky_loss,
+            "cldice": cldice_loss,
+        }
+        return total, components

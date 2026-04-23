@@ -26,7 +26,10 @@ from data_loader import (
     build_train_val_loaders,
     compute_rare_class_sampling_weights,
 )
-from data_utils import read_num_classes_from_labelmap
+from data_utils import (
+    read_class_names_from_labelmap,
+    read_num_classes_from_labelmap,
+)
 from losses import DiceCELoss
 from model_3d_unet import UNet3D
 from topbrain_validation import (
@@ -507,6 +510,94 @@ def _wandb_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
+def _log_wandb_summary_charts(
+    *,
+    wandb_run: Any,
+    history: dict[str, list[float]],
+    class_labels: list[str],
+) -> None:
+    """Emit end-of-run overlay charts to W&B.
+
+    Per-epoch scalars are already logged live; this just adds custom panels
+    that overlay multiple series on a single chart:
+
+    - ``summary/train_vs_val_loss``: total train loss vs total val loss.
+    - ``summary/train_loss_components``: each DiceCELoss term over epochs
+      (CE, Dice, Tversky, clDice).
+    - ``summary/val_loss_components``: the same for validation.
+    - ``summary/val_per_class_dice_history``: per-class Dice over epochs so
+      it's easy to spot classes that never converge.
+    """
+    if wandb is None:
+        return
+
+    epochs = history.get("epoch", [])
+    if not epochs:
+        return
+
+    def _sanitize(values: list[float]) -> list[float]:
+        return [v if np.isfinite(v) else 0.0 for v in values]
+
+    try:
+        wandb_run.log(
+            {
+                "summary/train_vs_val_loss": wandb.plot.line_series(
+                    xs=epochs,
+                    ys=[_sanitize(history["train_loss"]), _sanitize(history["val_loss"])],
+                    keys=["train_loss", "val_loss"],
+                    title="Train vs Val Loss",
+                    xname="epoch",
+                )
+            }
+        )
+
+        train_series = [
+            _sanitize(history[f"train_loss_{name}"])
+            for name in DiceCELoss.COMPONENT_NAMES
+        ]
+        val_series = [
+            _sanitize(history[f"val_loss_{name}"])
+            for name in DiceCELoss.COMPONENT_NAMES
+        ]
+        wandb_run.log(
+            {
+                "summary/train_loss_components": wandb.plot.line_series(
+                    xs=epochs,
+                    ys=train_series,
+                    keys=[f"train_{name}" for name in DiceCELoss.COMPONENT_NAMES],
+                    title="Train loss components (CE / Dice / Tversky / clDice)",
+                    xname="epoch",
+                ),
+                "summary/val_loss_components": wandb.plot.line_series(
+                    xs=epochs,
+                    ys=val_series,
+                    keys=[f"val_{name}" for name in DiceCELoss.COMPONENT_NAMES],
+                    title="Val loss components (CE / Dice / Tversky / clDice)",
+                    xname="epoch",
+                ),
+            }
+        )
+
+        num_classes = len(class_labels)
+        per_class_series = [
+            _sanitize(history[f"val_dice_c{c:02d}"]) for c in range(num_classes)
+        ]
+        keys = [f"c{c:02d}_{class_labels[c]}" for c in range(num_classes)]
+        wandb_run.log(
+            {
+                "summary/val_per_class_dice_history": wandb.plot.line_series(
+                    xs=epochs,
+                    ys=per_class_series,
+                    keys=keys,
+                    title="Per-class Dice over epochs",
+                    xname="epoch",
+                )
+            }
+        )
+    except Exception as exc:  # pragma: no cover - best-effort logging
+        print(f"warning: failed to log W&B summary charts: {exc}")
+
+
 def compute_class_weights(
     label_dir: Path,
     case_ids: list[str],
@@ -724,7 +815,15 @@ def train_one_epoch(
     device: torch.device,
     scaler: torch.amp.GradScaler | None = None,
     amp_dtype: torch.dtype | None = None,
-) -> float:
+) -> dict[str, float]:
+    """Train for one epoch and return per-component and aggregate statistics.
+
+    Returned dict always contains ``total`` (mean optimization loss) and
+    ``grad_norm`` (mean L2 gradient norm across steps). When the criterion
+    exposes ``forward_components``, the dict also contains per-term losses
+    keyed by ``ce``, ``dice``, ``tversky``, ``cldice`` so that W&B/CSV can
+    track each loss curve individually.
+    """
     ds_base_weights = torch.tensor(
         [1.0, 0.5, 0.25, 0.125], dtype=torch.float32, device=device
     )
@@ -782,8 +881,20 @@ def train_one_epoch(
             total = total + weights[i] * criterion(logits_i, target_i, target_skel=skel_i)
         return total
 
+    # Track the unweighted per-term losses returned by DiceCELoss. We use the
+    # finest-scale (primary) logits for reporting when deep supervision is on
+    # so that the numbers line up with validation (which runs without DS).
+    supports_components = hasattr(criterion, "forward_components")
+
+    def _primary_logits(logits_out: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+        if isinstance(logits_out, torch.Tensor):
+            return logits_out
+        return logits_out[0]
+
     model.train()
     running_loss = 0.0
+    running_grad_norm = 0.0
+    component_sums: dict[str, float] = {}
     n_steps = 0
     use_amp = scaler is not None and amp_dtype is not None and device.type == "cuda"
     for batch in loader:
@@ -804,17 +915,46 @@ def train_one_epoch(
                 logits = model(batch_x)
                 loss = _multiscale_loss(logits, batch_y, batch_skel)
             scaler.scale(loss).backward()
+            # Unscale before computing the real-scale gradient norm so the
+            # value we log matches the step actually applied.
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=float("inf")
+            )
             scaler.step(optimizer)
             scaler.update()
         else:
             logits = model(batch_x)
             loss = _multiscale_loss(logits, batch_y, batch_skel)
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=float("inf")
+            )
             optimizer.step()
 
+        if supports_components:
+            with torch.no_grad():
+                _, components = criterion.forward_components(
+                    _primary_logits(logits), batch_y, target_skel=batch_skel
+                )
+            for name, value in components.items():
+                component_sums[name] = (
+                    component_sums.get(name, 0.0) + float(value.item())
+                )
+
         running_loss += float(loss.item())
+        if torch.isfinite(grad_norm):
+            running_grad_norm += float(grad_norm.item())
         n_steps += 1
-    return running_loss / max(n_steps, 1)
+
+    divisor = max(n_steps, 1)
+    stats: dict[str, float] = {
+        "total": running_loss / divisor,
+        "grad_norm": running_grad_norm / divisor,
+    }
+    for name, total in component_sums.items():
+        stats[name] = total / divisor
+    return stats
 
 
 def _build_overfit_loaders(
@@ -907,6 +1047,20 @@ def main() -> int:
             dir=str(out_dir),
         )
         wandb_run.config.update({"resolved_device": str(device)}, allow_val_change=True)
+        # Make `epoch` the default x-axis for every chart so train/* and val/*
+        # scalars end up aligned in the same per-section dashboard.
+        wandb_run.define_metric("epoch")
+        wandb_run.define_metric("train/*", step_metric="epoch")
+        wandb_run.define_metric("val/*", step_metric="epoch")
+        wandb_run.define_metric("optim/*", step_metric="epoch")
+        wandb_run.define_metric("topbrain/*", step_metric="epoch")
+        wandb_run.define_metric("sys/*", step_metric="epoch")
+        wandb_run.define_metric("time/*", step_metric="epoch")
+        # Highlight which scalars should drive the "best" summary panel.
+        wandb_run.define_metric("val/mean_fg_dice", summary="max")
+        wandb_run.define_metric("val_mean_fg_dice", summary="max")
+        wandb_run.define_metric("val/loss_total", summary="min")
+        wandb_run.define_metric("train/loss_total", summary="min")
         print(
             "W&B enabled: "
             f"entity={args.wandb_entity} project={args.wandb_project} "
@@ -1030,6 +1184,14 @@ def main() -> int:
         use_checkpoint=bool(args.grad_checkpoint),
         deep_supervision=bool(args.deep_supervision),
     ).to(device)
+    if wandb_run is not None:
+        # Weights & Biases will automatically log weight and gradient
+        # histograms every `log_freq` steps. This gives per-layer histograms
+        # in the "Gradients" / "Parameters" panels of the run dashboard.
+        try:
+            wandb.watch(model, log="all", log_freq=100, log_graph=False)
+        except Exception as exc:  # pragma: no cover - best-effort extra logging
+            print(f"warning: wandb.watch failed ({exc}); skipping gradient histograms.")
     if args.grad_checkpoint:
         print("gradient checkpointing enabled on UNet encoder/decoder blocks")
     if args.deep_supervision:
@@ -1119,6 +1281,20 @@ def main() -> int:
     if resuming and not args.resume.is_file():
         raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
 
+    # Resolve per-class display names from the ITK-SNAP labelmap so per-class
+    # dice can be logged with readable keys (e.g. val_dice_c05_R-M1) and
+    # rendered as a labelled bar chart in W&B.
+    labelmap_path = Path(
+        f"training_data_resampled/itksnap_labelmap_txt/labelmap_topbrain_{args.topbrain_track}.txt"
+    )
+    class_names = read_class_names_from_labelmap(labelmap_path, num_classes=num_classes)
+
+    def _class_label(idx: int) -> str:
+        name = class_names[idx] if idx < len(class_names) else f"class_{idx}"
+        # Sanitize a bit so it reads cleanly in W&B chart axes / CSV headers.
+        safe = name.replace(" ", "_").replace('"', "").strip("_") or f"class_{idx}"
+        return safe
+
     # Only (re)write the CSV header if the file does not already contain rows.
     # When resuming, we append so prior epoch history is preserved.
     metrics_has_rows = metrics_csv.is_file() and metrics_csv.stat().st_size > 0
@@ -1131,9 +1307,15 @@ def main() -> int:
                     "lr",
                     "train_loss",
                     "val_loss",
+                    "train_grad_norm",
+                    *[f"train_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
+                    *[f"val_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     "val_mean_fg_dice",
                     "val_mean_fg_dice_all_cases_present",
-                    *[f"val_dice_c{c:02d}" for c in range(num_classes)],
+                    *[
+                        f"val_dice_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
                     *_topbrain_csv_columns("tb_subset"),
                     *_topbrain_csv_columns("tb_full"),
                 ]
@@ -1143,6 +1325,22 @@ def main() -> int:
     start_epoch = 1
     final_weights_path = out_dir / "model_final_weights.pt"
     best_weights_path = out_dir / "model_best_weights.pt"
+
+    # In-memory history used to build multi-line overlay charts at end-of-run
+    # (train-vs-val total, per-component train, per-component val, per-class
+    # dice history). Scalars are still logged per-epoch for live line charts,
+    # this just adds dedicated custom panels once everything is finished.
+    history: dict[str, list[float]] = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "val_mean_fg_dice": [],
+    }
+    for name in DiceCELoss.COMPONENT_NAMES:
+        history[f"train_loss_{name}"] = []
+        history[f"val_loss_{name}"] = []
+    for c in range(num_classes):
+        history[f"val_dice_c{c:02d}"] = []
 
     if resuming:
         last_completed_epoch, best_val_dice = _load_checkpoint(
@@ -1202,7 +1400,7 @@ def main() -> int:
                     label_path=label_path,
                 )
 
-        train_loss = train_one_epoch(
+        train_stats = train_one_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
@@ -1211,11 +1409,19 @@ def main() -> int:
             scaler=scaler,
             amp_dtype=amp_dtype if amp_enabled else None,
         )
+        train_loss = train_stats["total"]
+        train_grad_norm = train_stats.get("grad_norm", float("nan"))
+        train_components = {
+            name: train_stats[name]
+            for name in DiceCELoss.COMPONENT_NAMES
+            if name in train_stats
+        }
         (
             val_loss,
             val_mean_fg_dice,
             val_mean_fg_dice_all_cases_present,
             per_class_dice,
+            val_components,
         ) = validate_one_epoch(
             model=model,
             val_case_ids=val_case_ids,
@@ -1241,6 +1447,12 @@ def main() -> int:
         lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step()
 
+        def _fmt_component(src: dict[str, float], name: str) -> str:
+            value = src.get(name)
+            if value is None or not np.isfinite(value):
+                return ""
+            return f"{value:.6f}"
+
         with metrics_csv.open("a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -1249,6 +1461,15 @@ def main() -> int:
                     f"{lr:.10f}",
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
+                    "" if not np.isfinite(train_grad_norm) else f"{train_grad_norm:.6f}",
+                    *[
+                        _fmt_component(train_components, name)
+                        for name in DiceCELoss.COMPONENT_NAMES
+                    ],
+                    *[
+                        _fmt_component(val_components, name)
+                        for name in DiceCELoss.COMPONENT_NAMES
+                    ],
                     f"{val_mean_fg_dice:.6f}",
                     (
                         ""
@@ -1289,16 +1510,32 @@ def main() -> int:
         best_tag = " [new best]" if improved_best else ""
         print(
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
-            f"lr={lr:.2e} train_loss={train_loss:.6f} "
+            f"lr={lr:.2e} grad_norm={train_grad_norm:.3f} "
+            f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f}"
             f"{best_tag} "
             "val_mean_fg_dice_all_cases_present="
             f"{val_mean_fg_dice_all_cases_present:.6f} "
             f"time={elapsed:.1f}s"
         )
+        if train_components or val_components:
+            train_bits = ", ".join(
+                f"{name}={train_components[name]:.4f}"
+                for name in DiceCELoss.COMPONENT_NAMES
+                if name in train_components
+            )
+            val_bits = ", ".join(
+                f"{name}={val_components[name]:.4f}"
+                for name in DiceCELoss.COMPONENT_NAMES
+                if name in val_components
+            )
+            print(f"loss_components: train[{train_bits}] val[{val_bits}]")
         print(
             "per_class_dice: "
-            + ", ".join(f"c{idx:02d}={d:.4f}" for idx, d in enumerate(per_class_dice))
+            + ", ".join(
+                f"c{idx:02d}_{_class_label(idx)}={d:.4f}"
+                for idx, d in enumerate(per_class_dice)
+            )
         )
         if run_topbrain_this_epoch:
             print(
@@ -1324,19 +1561,70 @@ def main() -> int:
                 )
 
         if wandb_run is not None:
-            log_payload: dict[str, float | int] = {
+            log_payload: dict[str, Any] = {
                 "epoch": int(epoch),
-                "lr": float(lr),
+                "time/epoch_sec": float(elapsed),
+                "optim/lr": float(lr),
+                "optim/grad_norm": float(train_grad_norm),
+                # Top-level mirrors so the summary panel picks them up by default.
                 "train_loss": float(train_loss),
                 "val_loss": float(val_loss),
                 "val_mean_fg_dice": float(val_mean_fg_dice),
+                # Namespaced metrics give clean per-section dashboards:
+                #   train/loss_*  vs  val/loss_*    (train-vs-val overlay)
+                #   val/dice/class/<name>           (per-class dice)
+                "train/loss_total": float(train_loss),
+                "val/loss_total": float(val_loss),
+                "val/mean_fg_dice": float(val_mean_fg_dice),
+                "val/best_mean_fg_dice": float(best_val_dice),
             }
+            for name, value in train_components.items():
+                if np.isfinite(value):
+                    log_payload[f"train/loss_{name}"] = float(value)
+            for name, value in val_components.items():
+                if np.isfinite(value):
+                    log_payload[f"val/loss_{name}"] = float(value)
             if np.isfinite(val_mean_fg_dice_all_cases_present):
                 log_payload["val_mean_fg_dice_all_cases_present"] = float(
                     val_mean_fg_dice_all_cases_present
                 )
+                log_payload["val/mean_fg_dice_all_cases_present"] = float(
+                    val_mean_fg_dice_all_cases_present
+                )
+
+            # Per-class Dice: log as both flat scalars (auto line charts) and a
+            # bar chart table keyed by class name so W&B renders a labelled
+            # per-class view.
+            per_class_rows: list[list[Any]] = []
             for idx, d in enumerate(per_class_dice):
+                safe_name = _class_label(idx)
                 log_payload[f"val_dice_c{idx:02d}"] = float(d)
+                log_payload[f"val/dice/class/{safe_name}"] = float(d)
+                per_class_rows.append([f"{idx:02d}_{safe_name}", float(d)])
+            per_class_table = wandb.Table(
+                data=per_class_rows, columns=["class", "dice"]
+            )
+            log_payload["val/per_class_dice_bar"] = wandb.plot.bar(
+                per_class_table,
+                label="class",
+                value="dice",
+                title=f"Per-class Dice (epoch {epoch})",
+            )
+
+            # GPU memory (rank 0) so we can spot OOM cliffs on the same axis.
+            if device.type == "cuda":
+                try:
+                    log_payload["sys/gpu_mem_allocated_gb"] = (
+                        float(torch.cuda.memory_allocated(device)) / (1024**3)
+                    )
+                    log_payload["sys/gpu_mem_reserved_gb"] = (
+                        float(torch.cuda.memory_reserved(device)) / (1024**3)
+                    )
+                    log_payload["sys/gpu_mem_max_allocated_gb"] = (
+                        float(torch.cuda.max_memory_allocated(device)) / (1024**3)
+                    )
+                except Exception:
+                    pass
 
             if run_topbrain_this_epoch:
                 log_payload["tb_subset_ran"] = 1
@@ -1345,6 +1633,7 @@ def main() -> int:
                     value = subset_metrics[key]
                     if np.isfinite(value):
                         log_payload[f"tb_subset_{key}"] = float(value)
+                        log_payload[f"topbrain/subset/{key}"] = float(value)
             else:
                 log_payload["tb_subset_ran"] = 0
 
@@ -1355,10 +1644,29 @@ def main() -> int:
                     value = full_metrics[key]
                     if np.isfinite(value):
                         log_payload[f"tb_full_{key}"] = float(value)
+                        log_payload[f"topbrain/full/{key}"] = float(value)
             else:
                 log_payload["tb_full_ran"] = 0
 
             wandb_run.log(log_payload, step=epoch)
+
+        # Always append to in-memory history (even when W&B is disabled) so we
+        # can keep an internal record and still build charts if a run later
+        # opts in to W&B sync.
+        history["epoch"].append(float(epoch))
+        history["train_loss"].append(float(train_loss))
+        history["val_loss"].append(float(val_loss))
+        history["val_mean_fg_dice"].append(float(val_mean_fg_dice))
+        for name in DiceCELoss.COMPONENT_NAMES:
+            history[f"train_loss_{name}"].append(
+                float(train_components.get(name, float("nan")))
+            )
+            history[f"val_loss_{name}"].append(
+                float(val_components.get(name, float("nan")))
+            )
+        for c in range(num_classes):
+            value = per_class_dice[c] if c < len(per_class_dice) else float("nan")
+            history[f"val_dice_c{c:02d}"].append(float(value))
 
     final_epoch_ran_topbrain_full = (
         topbrain_enabled
@@ -1391,8 +1699,13 @@ def main() -> int:
                     label_path=label_path,
                 )
 
-        _final_val_loss, _final_val_mean_fg_dice, _final_val_mean_fg_dice_all_cases_present, _ = (
-            validate_one_epoch(
+        (
+            _final_val_loss,
+            _final_val_mean_fg_dice,
+            _final_val_mean_fg_dice_all_cases_present,
+            _final_per_class_dice,
+            _final_val_components,
+        ) = validate_one_epoch(
             model=model,
             val_case_ids=final_case_ids,
             image_dir=image_dir,
@@ -1403,7 +1716,6 @@ def main() -> int:
             device=device,
             num_classes=num_classes,
             topbrain_case_callback=_final_topbrain_case_callback,
-            )
         )
         final_metrics = final_topbrain_acc.finalize()
         print(
@@ -1420,6 +1732,11 @@ def main() -> int:
     torch.save(model.state_dict(), final_weights_path)
     if wandb_run is not None:
         wandb_run.summary["best_val_mean_fg_dice"] = float(best_val_dice)
+        _log_wandb_summary_charts(
+            wandb_run=wandb_run,
+            history=history,
+            class_labels=[_class_label(c) for c in range(num_classes)],
+        )
         artifact_name = f"{out_dir.name}-{wandb_run.id}-artifacts"
         artifact = wandb.Artifact(name=artifact_name, type="training_outputs")
         for path in (best_weights_path, final_weights_path, metrics_csv):

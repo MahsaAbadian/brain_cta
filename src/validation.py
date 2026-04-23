@@ -58,11 +58,22 @@ def validate_one_epoch(
     device: torch.device,
     num_classes: int,
     topbrain_case_callback: Callable[[str, np.ndarray, Path], None] | None = None,
-) -> tuple[float, float, float, list[float]]:
-    """Run one epoch of full-volume sliding-window validation."""
+) -> tuple[float, float, float, list[float], dict[str, float]]:
+    """Run one epoch of full-volume sliding-window validation.
+
+    Returns:
+        A tuple ``(avg_loss, mean_fg_dice, mean_fg_dice_all_cases_present,
+        per_class_dice, component_losses)`` where ``component_losses`` maps
+        each DiceCELoss sub-term name (``ce``, ``dice``, ``tversky``,
+        ``cldice``) to its mean patch-level loss over the sliding window.
+        Components not available (e.g. if the criterion does not expose
+        ``forward_components``) are omitted.
+    """
     model.eval()
     running_loss = 0.0
     n_steps = 0
+    component_sums: dict[str, float] = {}
+    supports_components = hasattr(criterion, "forward_components")
 
     per_class_sum = [0.0] * num_classes
     per_class_count = [0] * num_classes
@@ -107,7 +118,16 @@ def validate_one_epoch(
                         patch_y = torch.from_numpy(patch_lbl).unsqueeze(0).to(device)
 
                         logits = model(patch_x)
-                        loss = criterion(logits, patch_y)
+                        if supports_components:
+                            loss, components = criterion.forward_components(
+                                logits, patch_y
+                            )
+                            for name, value in components.items():
+                                component_sums[name] = (
+                                    component_sums.get(name, 0.0) + float(value.item())
+                                )
+                        else:
+                            loss = criterion(logits, patch_y)
                         running_loss += float(loss.item())
                         n_steps += 1
 
@@ -162,4 +182,14 @@ def validate_one_epoch(
         if fg_all_cases_scores
         else float("nan")
     )
-    return avg_loss, mean_fg_dice, mean_fg_dice_all_cases_present, per_class_dice
+    divisor = max(n_steps, 1)
+    component_losses = {
+        name: total / divisor for name, total in component_sums.items()
+    }
+    return (
+        avg_loss,
+        mean_fg_dice,
+        mean_fg_dice_all_cases_present,
+        per_class_dice,
+        component_losses,
+    )
