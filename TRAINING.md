@@ -251,6 +251,7 @@ This can inflate means when many classes are absent.
 - `--lr` (default: `2e-4`): AdamW learning rate.
 - `--weight-decay` (default: `1e-5`): AdamW weight decay.
 - `--base-ch` (default: `16`): base channels of U-Net.
+- `--deep-supervision` (default: off): training-only auxiliary logits at decoder scales with weighted multi-scale loss.
 - `--seed` (default: `42`): random seed for Python, NumPy, and PyTorch.
 - `--save-every` (default: `1`): save epoch checkpoint every N epochs (`<=0` disables periodic epoch checkpoints).
 - `--out-dir` (default: `runs/baseline`): output directory for metrics and checkpoints.

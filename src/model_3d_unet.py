@@ -38,6 +38,7 @@ class UNet3D(nn.Module):
         num_classes: int = 41,
         base_ch: int = 16,
         use_checkpoint: bool = False,
+        deep_supervision: bool = False,
     ):
         super().__init__()
         # When enabled, encoder/decoder ConvBlocks are run via
@@ -46,6 +47,8 @@ class UNet3D(nn.Module):
         # them. Trades ~25-35% extra compute per step for a large drop in peak
         # activation memory. Results are bit-exact vs. non-checkpointed.
         self.use_checkpoint = use_checkpoint
+        # If enabled, return additional decoder-scale logits during training only.
+        self.deep_supervision = deep_supervision
 
         # Encoder
         self.enc1 = ConvBlock3D(in_channels, base_ch)
@@ -78,6 +81,10 @@ class UNet3D(nn.Module):
 
         # Final 1x1x1 conv -> logits
         self.out_conv = nn.Conv3d(base_ch, num_classes, kernel_size=1)
+        if self.deep_supervision:
+            self.ds2 = nn.Conv3d(base_ch * 2, num_classes, kernel_size=1)
+            self.ds3 = nn.Conv3d(base_ch * 4, num_classes, kernel_size=1)
+            self.ds4 = nn.Conv3d(base_ch * 8, num_classes, kernel_size=1)
 
     @staticmethod
     def _match_size(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -100,7 +107,7 @@ class UNet3D(nn.Module):
             return checkpoint(block, x, use_reentrant=False)
         return block(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
         # Encoder path
         e1 = self._run_block(self.enc1, x)
         e2 = self._run_block(self.enc2, self.pool1(e1))
@@ -127,6 +134,8 @@ class UNet3D(nn.Module):
         d1 = self._run_block(self.dec1, torch.cat([d1, e1], dim=1))
 
         logits = self.out_conv(d1)  # raw logits
+        if self.training and self.deep_supervision:
+            return [logits, self.ds2(d2), self.ds3(d3), self.ds4(d4)]
         return logits
 
 

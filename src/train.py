@@ -13,6 +13,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 try:
@@ -407,6 +408,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--deep-supervision",
+        action="store_true",
+        help=(
+            "Enable training-only deep supervision heads on decoder scales "
+            "(dec2/dec3/dec4). Adds weighted multi-scale loss with nnUNet-style "
+            "weights [1, 1/2, 1/4, 1/8] normalized to sum to 1."
+        ),
+    )
+    parser.add_argument(
         "--amp-dtype",
         type=str,
         choices=("fp16", "bf16"),
@@ -715,6 +725,63 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler | None = None,
     amp_dtype: torch.dtype | None = None,
 ) -> float:
+    ds_base_weights = torch.tensor(
+        [1.0, 0.5, 0.25, 0.125], dtype=torch.float32, device=device
+    )
+    ds_base_weights = ds_base_weights / ds_base_weights.sum()
+
+    def _resize_target_for_logits(
+        target_full: torch.Tensor, logits_scale: torch.Tensor
+    ) -> torch.Tensor:
+        if target_full.shape[1:] == logits_scale.shape[2:]:
+            return target_full
+        target_small = F.interpolate(
+            target_full.unsqueeze(1).float(),
+            size=logits_scale.shape[2:],
+            mode="nearest",
+        ).squeeze(1)
+        return target_small.long()
+
+    def _resize_skeleton_for_logits(
+        skel_full: torch.Tensor | None, logits_scale: torch.Tensor
+    ) -> torch.Tensor | None:
+        if skel_full is None:
+            return None
+        if skel_full.shape[2:] == logits_scale.shape[2:]:
+            return skel_full
+        return F.interpolate(
+            skel_full,
+            size=logits_scale.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+
+    def _multiscale_loss(
+        logits_out: torch.Tensor | list[torch.Tensor],
+        target_full: torch.Tensor,
+        skel_full: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if isinstance(logits_out, torch.Tensor):
+            return criterion(logits_out, target_full, target_skel=skel_full)
+
+        logits_scales = logits_out
+        if len(logits_scales) == 0:
+            raise ValueError("Deep supervision logits list is empty.")
+
+        if len(logits_scales) > ds_base_weights.numel:
+            raise ValueError(
+                f"Deep supervision returned {len(logits_scales)} scales, "
+                f"but only {ds_base_weights.numel} weights are defined."
+            )
+        weights = ds_base_weights[: len(logits_scales)]
+        weights = weights / weights.sum()
+        total = torch.zeros((), dtype=logits_scales[0].dtype, device=logits_scales[0].device)
+        for i, logits_i in enumerate(logits_scales):
+            target_i = _resize_target_for_logits(target_full, logits_i)
+            skel_i = _resize_skeleton_for_logits(skel_full, logits_i)
+            total = total + weights[i] * criterion(logits_i, target_i, target_skel=skel_i)
+        return total
+
     model.train()
     running_loss = 0.0
     n_steps = 0
@@ -735,13 +802,13 @@ def train_one_epoch(
         if use_amp:
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                 logits = model(batch_x)
-                loss = criterion(logits, batch_y, target_skel=batch_skel)
+                loss = _multiscale_loss(logits, batch_y, batch_skel)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             logits = model(batch_x)
-            loss = criterion(logits, batch_y, target_skel=batch_skel)
+            loss = _multiscale_loss(logits, batch_y, batch_skel)
             loss.backward()
             optimizer.step()
 
@@ -961,9 +1028,12 @@ def main() -> int:
         num_classes=num_classes,
         base_ch=args.base_ch,
         use_checkpoint=bool(args.grad_checkpoint),
+        deep_supervision=bool(args.deep_supervision),
     ).to(device)
     if args.grad_checkpoint:
         print("gradient checkpointing enabled on UNet encoder/decoder blocks")
+    if args.deep_supervision:
+        print("deep supervision enabled (training-only multi-scale logits)")
     criterion = DiceCELoss(
         num_classes=num_classes,
         dice_weight=args.dice_weight,
