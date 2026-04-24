@@ -1,0 +1,184 @@
+_wandb:
+    value:
+        cli_version: 0.26.0
+        e:
+            gatcm2kmlmlsrtszgiae8tmchbiqq7be:
+                args:
+                    - --epochs
+                    - "200"
+                    - --patch-size
+                    - "128"
+                    - "128"
+                    - "128"
+                    - --num-patches-per-volume
+                    - "2"
+                    - --ce-weight
+                    - "0.5"
+                    - --dice-weight
+                    - "1.0"
+                    - --tversky-weight
+                    - "1.0"
+                    - --tversky-alpha
+                    - "0.7"
+                    - --tversky-beta
+                    - "0.3"
+                    - --tversky-gamma
+                    - "1.0"
+                    - --cldice-weight
+                    - "2.0"
+                    - --cldice-iters
+                    - "12"
+                    - --enable-ce-class-weights
+                    - --ce-weight-max
+                    - "8"
+                    - --rare-class-mode
+                    - hybrid
+                    - --rare-class-patch-prob
+                    - "0.5"
+                    - --wandb
+                    - --wandb-project
+                    - topbrain
+                    - --wandb-run-name
+                    - thin_vessel_phase1
+                    - --wandb-tags
+                    - thin-vessel,phase1
+                    - --out-dir
+                    - runs/thin_vessel_phase1
+                codePath: src/train.py
+                codePathLocal: src/train.py
+                email: mahsa.abadian@gmail.com
+                executable: /home/exouser/topbrain/.venv/bin/python
+                git:
+                    commit: b89f5d9e0151e3e49dc297eda8d2f126096262e9
+                    remote: https://github.com/MahsaAbadian/brain_cta.git
+                host: unet-runs
+                os: Linux-6.17.0-22-generic-x86_64-with-glibc2.39
+                program: /home/exouser/topbrain/brain_cta/src/train.py
+                python: CPython 3.12.3
+                root: runs/thin_vessel_phase1
+                startedAt: "2026-04-23T01:44:22.647179Z"
+                writerId: gatcm2kmlmlsrtszgiae8tmchbiqq7be
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 15
+                - 16
+            "4": 3.12.3
+            "5": 0.26.0
+            "12": 0.26.0
+            "13": linux-x86_64
+amp:
+    value: false
+amp_dtype:
+    value: fp16
+base_ch:
+    value: 16
+batch_size:
+    value: 1
+ce_weight:
+    value: 0.5
+ce_weight_max:
+    value: 8
+ce_weight_min:
+    value: null
+checkpoint_every:
+    value: 0
+cldice_channel_chunk:
+    value: 0
+cldice_class_ids:
+    value: null
+cldice_iters:
+    value: 12
+cldice_target_skeleton_dir:
+    value: null
+cldice_weight:
+    value: 2
+deep_supervision:
+    value: false
+device:
+    value: auto
+dice_weight:
+    value: 1
+enable_ce_class_weights:
+    value: true
+epochs:
+    value: 200
+fold:
+    value: 0
+fold_subdir:
+    value: false
+grad_checkpoint:
+    value: false
+keep_last_checkpoints:
+    value: 3
+lr:
+    value: 0.0002
+num_patches_per_volume:
+    value: 2
+num_workers:
+    value: 0
+out_dir:
+    value: runs/thin_vessel_phase1
+overfit_case_id:
+    value: null
+overfit_disable_augment:
+    value: false
+patch_size:
+    value:
+        - 128
+        - 128
+        - 128
+rare_class_mode:
+    value: hybrid
+rare_class_patch_prob:
+    value: 0.5
+rare_class_weight_max:
+    value: 4
+resolved_device:
+    value: cpu
+resume:
+    value: null
+seed:
+    value: 42
+splits_json:
+    value: training_data_resampled/split/splits_final.json
+topbrain_disable:
+    value: false
+topbrain_eval_every_n_epochs:
+    value: 5
+topbrain_full_max_cases:
+    value: null
+topbrain_per_epoch:
+    value: false
+topbrain_subset_size:
+    value: 4
+topbrain_track:
+    value: ct
+tversky_alpha:
+    value: 0.7
+tversky_beta:
+    value: 0.3
+tversky_gamma:
+    value: 1
+tversky_weight:
+    value: 1
+val_stride:
+    value: null
+wandb:
+    value: true
+wandb_entity:
+    value: null
+wandb_project:
+    value: topbrain
+wandb_run_name:
+    value: thin_vessel_phase1
+wandb_tags:
+    value: thin-vessel,phase1
+weight_decay:
+    value: 1e-05
