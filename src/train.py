@@ -463,6 +463,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--load-weights",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to weights-only model state_dict (.pt), such as "
+            "model_final_weights.pt or model_best_weights.pt. Initializes the "
+            "model from those weights but starts a fresh optimizer, scheduler, "
+            "epoch counter, and RNG state. Mutually exclusive with --resume."
+        ),
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Enable Weights & Biases run logging.",
@@ -791,6 +802,12 @@ def _load_checkpoint(
     return int(state["epoch"]), float(state["best_val_dice"])
 
 
+def _load_model_weights(path: Path, *, model: nn.Module, device: torch.device) -> None:
+    """Load weights-only model state produced by torch.save(model.state_dict())."""
+    state = torch.load(str(path), map_location=device, weights_only=True)
+    model.load_state_dict(state)
+
+
 def _rotate_periodic_checkpoints(out_dir: Path, keep: int) -> None:
     """Delete periodic checkpoints beyond the `keep` most recent.
 
@@ -1014,6 +1031,11 @@ def _build_overfit_loaders(
 
 def main() -> int:
     args = parse_args()
+    if args.resume is not None and args.load_weights is not None:
+        raise ValueError("--resume and --load-weights are mutually exclusive.")
+    if args.load_weights is not None and not args.load_weights.is_file():
+        raise FileNotFoundError(f"--load-weights file not found: {args.load_weights}")
+
     cldice_class_ids = _parse_class_id_list(args.cldice_class_ids)
     rare_class_mode = _parse_rare_class_mode(args.rare_class_mode)
     target_skeleton_dir = args.cldice_target_skeleton_dir
@@ -1184,6 +1206,12 @@ def main() -> int:
         use_checkpoint=bool(args.grad_checkpoint),
         deep_supervision=bool(args.deep_supervision),
     ).to(device)
+    if args.load_weights is not None:
+        _load_model_weights(args.load_weights, model=model, device=device)
+        print(
+            f"loaded model weights from {args.load_weights}; "
+            "optimizer, scheduler, epoch counter, and RNG start fresh."
+        )
     if wandb_run is not None:
         # Weights & Biases will automatically log weight and gradient
         # histograms every `log_freq` steps. This gives per-layer histograms
