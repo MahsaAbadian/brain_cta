@@ -86,6 +86,11 @@ def parse_args() -> argparse.Namespace:
         help="UNet base channels (must match training).",
     )
     parser.add_argument(
+        "--residual-blocks",
+        action="store_true",
+        help="Use residual U-Net blocks. Must match the training architecture.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -203,7 +208,12 @@ def main() -> int:
         raise RuntimeError(f"No validation cases found in {args.split_dir}")
 
     num_classes = read_num_classes_from_labelmap(args.labelmap_path)
-    model = UNet3D(in_channels=1, num_classes=num_classes, base_ch=args.base_ch).to(device)
+    model = UNet3D(
+        in_channels=1,
+        num_classes=num_classes,
+        base_ch=args.base_ch,
+        residual_blocks=bool(args.residual_blocks),
+    ).to(device)
 
     weights_obj = torch.load(args.checkpoint, map_location=device)
     state_dict = (

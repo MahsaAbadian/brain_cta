@@ -420,6 +420,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--residual-blocks",
+        action="store_true",
+        help=(
+            "Use residual ConvBlock3D modules throughout the U-Net. Disabled by "
+            "default so baseline checkpoints and architecture stay unchanged."
+        ),
+    )
+    parser.add_argument(
         "--amp-dtype",
         type=str,
         choices=("fp16", "bf16"),
@@ -1205,6 +1213,7 @@ def main() -> int:
         base_ch=args.base_ch,
         use_checkpoint=bool(args.grad_checkpoint),
         deep_supervision=bool(args.deep_supervision),
+        residual_blocks=bool(args.residual_blocks),
     ).to(device)
     if args.load_weights is not None:
         _load_model_weights(args.load_weights, model=model, device=device)
@@ -1224,6 +1233,8 @@ def main() -> int:
         print("gradient checkpointing enabled on UNet encoder/decoder blocks")
     if args.deep_supervision:
         print("deep supervision enabled (training-only multi-scale logits)")
+    if args.residual_blocks:
+        print("residual blocks enabled throughout UNet")
     criterion = DiceCELoss(
         num_classes=num_classes,
         dice_weight=args.dice_weight,

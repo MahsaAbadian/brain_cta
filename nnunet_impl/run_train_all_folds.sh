@@ -9,7 +9,7 @@ set -euo pipefail
 #   bash nnunet_impl/run_train_all_folds.sh 501 3d_fullres 0,2,4   # subset
 #
 # Environment variables forwarded to run_train.sh:
-#   NNUNET_RAW_DIR, NNUNET_PREPROCESSED_DIR, NNUNET_RESULTS_DIR
+#   NNUNET_RAW_DIR, NNUNET_PREPROCESSED_DIR, NNUNET_RESULTS_DIR, NNUNET_TRAINER
 
 DATASET_ID="${1:-501}"
 CONFIGURATION="${2:-3d_fullres}"

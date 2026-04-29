@@ -64,6 +64,14 @@ Single fold:
 bash nnunet_impl/run_train.sh 501 3d_fullres 0
 ```
 
+Custom TopBrain loss trainer:
+
+```bash
+NNUNET_TRAINER=nnUNetTrainerTopBrainClDice \
+TOPBRAIN_NNUNET_CLDICE_WEIGHT=0.25 \
+bash nnunet_impl/run_train.sh 501 3d_fullres 0
+```
+
 All folds in sequence:
 
 ```bash
@@ -73,6 +81,14 @@ bash nnunet_impl/run_train_all_folds.sh 501 3d_fullres 0,1,2,3,4
 - `501` = dataset id
 - `3d_fullres` = configuration
 - Third arg = comma-separated fold indices.
+- `nnUNetTrainerTopBrainClDice` uses a project-local CE + Dice + clDice loss.
+  The wrapper keeps the trainer in `nnunet_impl/custom_trainer.py`, so you do
+  not need to edit the installed `nnunetv2` package for single-GPU/CPU runs.
+- Custom loss knobs:
+  `TOPBRAIN_NNUNET_CE_WEIGHT`, `TOPBRAIN_NNUNET_DICE_WEIGHT`,
+  `TOPBRAIN_NNUNET_CLDICE_WEIGHT`, `TOPBRAIN_NNUNET_CLDICE_ITERS`,
+  `TOPBRAIN_NNUNET_CLDICE_CHANNEL_CHUNK`, and
+  `TOPBRAIN_NNUNET_INCLUDE_BACKGROUND=1`.
 
 ## 4) Predict validation cases
 

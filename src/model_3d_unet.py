@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 class ConvBlock3D(nn.Module):
-    """(Conv3d -> InstanceNorm -> ReLU) x2"""
+    """(Conv3d -> InstanceNorm -> LeakyReLU) x2."""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.block = nn.Sequential(
@@ -26,6 +26,37 @@ class ConvBlock3D(nn.Module):
         return self.block(x)
 
 
+class ResConvBlock3D(nn.Module):
+    """Residual 3D conv block with projection skip when channels change."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.LeakyReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_ch, affine=True),
+        )
+        self.skip = (
+            nn.Identity()
+            if in_ch == out_ch
+            else nn.Sequential(
+                nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.InstanceNorm3d(out_ch, affine=True),
+            )
+        )
+        self.act = nn.LeakyReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + self.skip(x)
+        return self.act(out)
+
+
 class UNet3D(nn.Module):
     """
     3D U-Net for multiclass vessel segmentation.
@@ -39,6 +70,7 @@ class UNet3D(nn.Module):
         base_ch: int = 16,
         use_checkpoint: bool = False,
         deep_supervision: bool = False,
+        residual_blocks: bool = False,
     ):
         super().__init__()
         # When enabled, encoder/decoder ConvBlocks are run via
@@ -49,35 +81,37 @@ class UNet3D(nn.Module):
         self.use_checkpoint = use_checkpoint
         # If enabled, return additional decoder-scale logits during training only.
         self.deep_supervision = deep_supervision
+        self.residual_blocks = residual_blocks
+        block_cls = ResConvBlock3D if residual_blocks else ConvBlock3D
 
         # Encoder
-        self.enc1 = ConvBlock3D(in_channels, base_ch)
+        self.enc1 = block_cls(in_channels, base_ch)
         self.pool1 = nn.MaxPool3d(2)
 
-        self.enc2 = ConvBlock3D(base_ch, base_ch * 2)
+        self.enc2 = block_cls(base_ch, base_ch * 2)
         self.pool2 = nn.MaxPool3d(2)
 
-        self.enc3 = ConvBlock3D(base_ch * 2, base_ch * 4)
+        self.enc3 = block_cls(base_ch * 2, base_ch * 4)
         self.pool3 = nn.MaxPool3d(2)
 
-        self.enc4 = ConvBlock3D(base_ch * 4, base_ch * 8)
+        self.enc4 = block_cls(base_ch * 4, base_ch * 8)
         self.pool4 = nn.MaxPool3d(2)
 
         # Bottleneck
-        self.bottleneck = ConvBlock3D(base_ch * 8, base_ch * 16)
+        self.bottleneck = block_cls(base_ch * 8, base_ch * 16)
 
         # Decoder (transpose conv upsample + skip concat + conv block)
         self.up4 = nn.ConvTranspose3d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
-        self.dec4 = ConvBlock3D(base_ch * 16, base_ch * 8)
+        self.dec4 = block_cls(base_ch * 16, base_ch * 8)
 
         self.up3 = nn.ConvTranspose3d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock3D(base_ch * 8, base_ch * 4)
+        self.dec3 = block_cls(base_ch * 8, base_ch * 4)
 
         self.up2 = nn.ConvTranspose3d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock3D(base_ch * 4, base_ch * 2)
+        self.dec2 = block_cls(base_ch * 4, base_ch * 2)
 
         self.up1 = nn.ConvTranspose3d(base_ch * 2, base_ch, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock3D(base_ch * 2, base_ch)
+        self.dec1 = block_cls(base_ch * 2, base_ch)
 
         # Final 1x1x1 conv -> logits
         self.out_conv = nn.Conv3d(base_ch, num_classes, kernel_size=1)

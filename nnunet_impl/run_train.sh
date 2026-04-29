@@ -15,12 +15,23 @@ set -euo pipefail
 #   NNUNET_WANDB_TAGS=baseline,cldice
 #   NNUNET_WANDB_MODE=offline
 #
+# Optional custom trainer:
+#   NNUNET_TRAINER=nnUNetTrainerTopBrainClDice
+#
+# Optional custom loss knobs for nnUNetTrainerTopBrainClDice:
+#   TOPBRAIN_NNUNET_CE_WEIGHT=1.0
+#   TOPBRAIN_NNUNET_DICE_WEIGHT=1.0
+#   TOPBRAIN_NNUNET_CLDICE_WEIGHT=0.25
+#   TOPBRAIN_NNUNET_CLDICE_ITERS=8
+#   TOPBRAIN_NNUNET_CLDICE_CHANNEL_CHUNK=4
+#
 # Optional extra train args:
 #   NNUNET_TRAIN_EXTRA_ARGS="--npz --c"
 
 DATASET_ID="${1:-501}"
 CONFIGURATION="${2:-3d_fullres}"
 FOLD="${3:-0}"
+TRAINER="${NNUNET_TRAINER:-nnUNetTrainer}"
 
 NNUNET_RAW_DIR="${NNUNET_RAW_DIR:-nnUNet_raw}"
 NNUNET_PREPROCESSED_DIR="${NNUNET_PREPROCESSED_DIR:-nnUNet_preprocessed}"
@@ -65,7 +76,11 @@ if [[ -f "${RAW_SPLIT_FILE}" ]]; then
   cp "${RAW_SPLIT_FILE}" "${PREPROCESSED_SPLIT_FILE}"
 fi
 
-TRAIN_CMD=(nnUNetv2_train "${DATASET_ID}" "${CONFIGURATION}" "${FOLD}")
+if [[ "${TRAINER}" == "nnUNetTrainer" ]]; then
+  TRAIN_CMD=(nnUNetv2_train "${DATASET_ID}" "${CONFIGURATION}" "${FOLD}")
+else
+  TRAIN_CMD=(python -m nnunet_impl.run_custom_training "${DATASET_ID}" "${CONFIGURATION}" "${FOLD}" -tr "${TRAINER}")
+fi
 if [[ -n "${NNUNET_TRAIN_EXTRA_ARGS:-}" ]]; then
   # Split extra args by shell words (quotes supported in env value).
   # shellcheck disable=SC2206
