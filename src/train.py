@@ -892,10 +892,10 @@ def train_one_epoch(
         if len(logits_scales) == 0:
             raise ValueError("Deep supervision logits list is empty.")
 
-        if len(logits_scales) > ds_base_weights.numel:
+        if len(logits_scales) > ds_base_weights.numel():
             raise ValueError(
                 f"Deep supervision returned {len(logits_scales)} scales, "
-                f"but only {ds_base_weights.numel} weights are defined."
+                f"but only {ds_base_weights.numel()} weights are defined."
             )
         weights = ds_base_weights[: len(logits_scales)]
         weights = weights / weights.sum()

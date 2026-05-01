@@ -17,7 +17,8 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from data_utils import load_split_ids, read_num_classes_from_labelmap
+from data_loader import load_fold_from_splits_json
+from data_utils import read_num_classes_from_labelmap
 from model_3d_unet import UNet3D
 
 
@@ -45,7 +46,25 @@ def parse_args() -> argparse.Namespace:
         "--split-dir",
         type=Path,
         default=Path("training_data_resampled/split"),
-        help="Directory containing val_cases.txt.",
+        help=(
+            "Legacy directory containing val_cases.txt. Only used when "
+            "--splits-json is missing."
+        ),
+    )
+    parser.add_argument(
+        "--splits-json",
+        type=Path,
+        default=Path("training_data_resampled/split/splits_final.json"),
+        help=(
+            "Canonical K-fold split file. When present, validation cases are "
+            "read from --fold in this file."
+        ),
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="Fold index read from --splits-json.",
     )
     parser.add_argument(
         "--image-dir",
@@ -155,6 +174,32 @@ def _sliding_window_predict(
     return pred
 
 
+def _load_val_case_ids(splits_json: Path | None, split_dir: Path, fold: int) -> list[str]:
+    if splits_json is not None and splits_json.is_file():
+        _, val_case_ids = load_fold_from_splits_json(splits_json, fold=fold)
+        source = f"fold {fold} in {splits_json}"
+    else:
+        val_path = split_dir / "val_cases.txt"
+        if not val_path.is_file():
+            raise FileNotFoundError(
+                "Validation split not found. Expected either "
+                f"{splits_json} or {val_path}. Generate splits with:\n"
+                "  python scripts/make_splits.py --force\n"
+                "or pass --splits-json/--split-dir explicitly."
+            )
+        val_case_ids = [
+            line.strip()
+            for line in val_path.read_text().splitlines()
+            if line.strip()
+        ]
+        source = str(val_path)
+
+    val_case_ids = sorted(set(val_case_ids))
+    if not val_case_ids:
+        raise RuntimeError(f"No validation cases found in {source}")
+    return val_case_ids
+
+
 def _run_topbrain_eval(
     *,
     track: str,
@@ -202,10 +247,7 @@ def main() -> int:
     pred_dir.mkdir(parents=True, exist_ok=True)
     gt_dir.mkdir(parents=True, exist_ok=True)
 
-    _, val_case_ids = load_split_ids(args.split_dir)
-    val_case_ids = sorted(set(val_case_ids))
-    if not val_case_ids:
-        raise RuntimeError(f"No validation cases found in {args.split_dir}")
+    val_case_ids = _load_val_case_ids(args.splits_json, args.split_dir, args.fold)
 
     num_classes = read_num_classes_from_labelmap(args.labelmap_path)
     model = UNet3D(
