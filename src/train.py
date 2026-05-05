@@ -736,6 +736,26 @@ def _topbrain_csv_values(ran: bool, metrics: dict[str, float]) -> list[str]:
     return values
 
 
+def _count_patch_class_hits(
+    labels: torch.Tensor,
+    num_classes: int,
+) -> tuple[list[int], int]:
+    """Count how many sampled patches contain each class at least once."""
+    if labels.ndim < 2:
+        raise ValueError(
+            f"Expected labels with patch and spatial dims, got shape {tuple(labels.shape)}"
+        )
+    hits = [0] * num_classes
+    flat = labels.detach().reshape(labels.shape[0], -1).cpu()
+    for patch_labels in flat:
+        present = torch.unique(patch_labels)
+        for raw_class_id in present.tolist():
+            class_id = int(raw_class_id)
+            if 0 <= class_id < num_classes:
+                hits[class_id] += 1
+    return hits, int(labels.shape[0])
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -921,6 +941,9 @@ def train_one_epoch(
     running_grad_norm = 0.0
     component_sums: dict[str, float] = {}
     n_steps = 0
+    num_classes = int(getattr(criterion, "num_classes", 0) or 0)
+    patch_hit_counts = [0] * num_classes
+    sampled_patch_count = 0
     use_amp = scaler is not None and amp_dtype is not None and device.type == "cuda"
     for batch in loader:
         batch_skel = None
@@ -929,6 +952,14 @@ def train_one_epoch(
         else:
             batch_x, batch_y, _ = batch
         batch_x, batch_y, batch_skel = _flatten_loader_batch(batch_x, batch_y, batch_skel)
+        if num_classes > 0:
+            batch_hits, batch_patch_count = _count_patch_class_hits(
+                batch_y,
+                num_classes,
+            )
+            sampled_patch_count += batch_patch_count
+            for class_id, hit_count in enumerate(batch_hits):
+                patch_hit_counts[class_id] += hit_count
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
         if batch_skel is not None:
@@ -976,9 +1007,12 @@ def train_one_epoch(
     stats: dict[str, float] = {
         "total": running_loss / divisor,
         "grad_norm": running_grad_norm / divisor,
+        "sampled_patches": float(sampled_patch_count),
     }
     for name, total in component_sums.items():
         stats[name] = total / divisor
+    for class_id, hit_count in enumerate(patch_hit_counts):
+        stats[f"patch_hit_c{class_id:02d}"] = float(hit_count)
     return stats
 
 
@@ -1334,9 +1368,14 @@ def main() -> int:
         safe = name.replace(" ", "_").replace('"', "").strip("_") or f"class_{idx}"
         return safe
 
-    # Only (re)write the CSV header if the file does not already contain rows.
-    # When resuming, we append so prior epoch history is preserved.
-    metrics_has_rows = metrics_csv.is_file() and metrics_csv.stat().st_size > 0
+    # Only (re)write the CSV header if the file does not already contain data
+    # rows. When resuming, we append so prior epoch history is preserved. A
+    # header-only CSV is treated as empty so schema updates do not create
+    # mismatched rows.
+    metrics_has_rows = False
+    if metrics_csv.is_file() and metrics_csv.stat().st_size > 0:
+        with metrics_csv.open("r", newline="") as f:
+            metrics_has_rows = sum(1 for _, _line in zip(range(2), f)) > 1
     if not metrics_has_rows:
         with metrics_csv.open("w", newline="") as f:
             writer = csv.writer(f)
@@ -1347,6 +1386,11 @@ def main() -> int:
                     "train_loss",
                     "val_loss",
                     "train_grad_norm",
+                    "train_sampled_patches",
+                    *[
+                        f"train_patch_hit_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
                     *[f"train_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     *[f"val_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     "val_mean_fg_dice",
@@ -1450,6 +1494,11 @@ def main() -> int:
         )
         train_loss = train_stats["total"]
         train_grad_norm = train_stats.get("grad_norm", float("nan"))
+        train_sampled_patches = int(train_stats.get("sampled_patches", 0.0))
+        train_patch_hits = [
+            int(train_stats.get(f"patch_hit_c{class_id:02d}", 0.0))
+            for class_id in range(num_classes)
+        ]
         train_components = {
             name: train_stats[name]
             for name in DiceCELoss.COMPONENT_NAMES
@@ -1501,6 +1550,8 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     "" if not np.isfinite(train_grad_norm) else f"{train_grad_norm:.6f}",
+                    train_sampled_patches,
+                    *[str(hit_count) for hit_count in train_patch_hits],
                     *[
                         _fmt_component(train_components, name)
                         for name in DiceCELoss.COMPONENT_NAMES
@@ -1569,6 +1620,29 @@ def main() -> int:
                 if name in val_components
             )
             print(f"loss_components: train[{train_bits}] val[{val_bits}]")
+        if train_sampled_patches > 0:
+            zero_hit_classes = [
+                f"c{idx:02d}_{_class_label(idx)}"
+                for idx, hit_count in enumerate(train_patch_hits)
+                if idx > 0 and hit_count == 0
+            ]
+            lowest_hit_classes = sorted(
+                (
+                    (hit_count, f"c{idx:02d}_{_class_label(idx)}")
+                    for idx, hit_count in enumerate(train_patch_hits)
+                    if idx > 0
+                ),
+                key=lambda item: item[0],
+            )[:8]
+            print(
+                "sampling_diagnostics: "
+                f"sampled_patches={train_sampled_patches} "
+                f"zero_hit_fg={len(zero_hit_classes)} "
+                "lowest_hits="
+                + ", ".join(
+                    f"{label}:{hit_count}" for hit_count, label in lowest_hit_classes
+                )
+            )
         print(
             "per_class_dice: "
             + ", ".join(
@@ -1616,7 +1690,28 @@ def main() -> int:
                 "val/loss_total": float(val_loss),
                 "val/mean_fg_dice": float(val_mean_fg_dice),
                 "val/best_mean_fg_dice": float(best_val_dice),
+                "train/sampled_patches": int(train_sampled_patches),
             }
+            patch_hit_rows: list[list[Any]] = []
+            for idx, hit_count in enumerate(train_patch_hits):
+                safe_name = _class_label(idx)
+                log_payload[f"train_patch_hit_c{idx:02d}"] = int(hit_count)
+                log_payload[f"train/sampling/patch_hit_count/{safe_name}"] = int(
+                    hit_count
+                )
+                if train_sampled_patches > 0:
+                    hit_rate = float(hit_count) / float(train_sampled_patches)
+                    log_payload[f"train/sampling/patch_hit_rate/{safe_name}"] = hit_rate
+                patch_hit_rows.append([f"{idx:02d}_{safe_name}", int(hit_count)])
+            patch_hit_table = wandb.Table(
+                data=patch_hit_rows, columns=["class", "patch_hits"]
+            )
+            log_payload["train/sampling/patch_hit_bar"] = wandb.plot.bar(
+                patch_hit_table,
+                label="class",
+                value="patch_hits",
+                title=f"Train patch class hits (epoch {epoch})",
+            )
             for name, value in train_components.items():
                 if np.isfinite(value):
                     log_payload[f"train/loss_{name}"] = float(value)
