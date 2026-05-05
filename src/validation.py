@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypedDict
 
 import nibabel as nib
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+class ValidationSupport(TypedDict):
+    gt_case_counts: list[int]
+    pred_case_counts: list[int]
+    gt_voxel_counts: list[int]
+    pred_voxel_counts: list[int]
 
 
 def _axis_starts(dim: int, patch: int, step: int) -> list[int]:
@@ -58,14 +65,23 @@ def validate_one_epoch(
     device: torch.device,
     num_classes: int,
     topbrain_case_callback: Callable[[str, np.ndarray, Path], None] | None = None,
-) -> tuple[float, float, float, list[float], dict[str, float]]:
+) -> tuple[
+    float,
+    float,
+    float,
+    list[float],
+    dict[str, float],
+    ValidationSupport,
+]:
     """Run one epoch of full-volume sliding-window validation.
 
     Returns:
         A tuple ``(avg_loss, mean_fg_dice, mean_fg_dice_all_cases_present,
-        per_class_dice, component_losses)`` where ``component_losses`` maps
-        each DiceCELoss sub-term name (``ce``, ``dice``, ``tversky``,
-        ``cldice``) to its mean patch-level loss over the sliding window.
+        per_class_dice, component_losses, support)`` where
+        ``component_losses`` maps each DiceCELoss sub-term name (``ce``,
+        ``dice``, ``tversky``, ``cldice``) to its mean patch-level loss over
+        the sliding window. ``support`` reports per-class validation cases and
+        voxels where GT/prediction are present.
         Components not available (e.g. if the criterion does not expose
         ``forward_components``) are omitted.
     """
@@ -78,6 +94,9 @@ def validate_one_epoch(
     per_class_sum = [0.0] * num_classes
     per_class_count = [0] * num_classes
     gt_presence_count = [0] * num_classes
+    pred_presence_count = [0] * num_classes
+    gt_voxel_count = [0] * num_classes
+    pred_voxel_count = [0] * num_classes
     pred_or_gt_presence_any = [False] * num_classes
 
     with torch.no_grad():
@@ -153,6 +172,17 @@ def validate_one_epoch(
             for c in present_classes:
                 if 0 <= int(c) < num_classes:
                     gt_presence_count[int(c)] += 1
+            pred_classes, pred_counts = np.unique(pred_np, return_counts=True)
+            for raw_c, raw_count in zip(pred_classes, pred_counts):
+                c = int(raw_c)
+                if 0 <= c < num_classes:
+                    pred_presence_count[c] += 1
+                    pred_voxel_count[c] += int(raw_count)
+            gt_classes, gt_counts = np.unique(target_np, return_counts=True)
+            for raw_c, raw_count in zip(gt_classes, gt_counts):
+                c = int(raw_c)
+                if 0 <= c < num_classes:
+                    gt_voxel_count[c] += int(raw_count)
             dice_vals, valid_counts = _compute_per_class_dice(
                 pred=pred, target=target, num_classes=num_classes
             )
@@ -186,10 +216,17 @@ def validate_one_epoch(
     component_losses = {
         name: total / divisor for name, total in component_sums.items()
     }
+    support: ValidationSupport = {
+        "gt_case_counts": gt_presence_count,
+        "pred_case_counts": pred_presence_count,
+        "gt_voxel_counts": gt_voxel_count,
+        "pred_voxel_counts": pred_voxel_count,
+    }
     return (
         avg_loss,
         mean_fg_dice,
         mean_fg_dice_all_cases_present,
         per_class_dice,
         component_losses,
+        support,
     )

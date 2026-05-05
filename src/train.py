@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
+import nibabel as nib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -756,6 +757,102 @@ def _count_patch_class_hits(
     return hits, int(labels.shape[0])
 
 
+def _compute_split_class_stats(
+    *,
+    label_dir: Path,
+    case_ids: list[str],
+    num_classes: int,
+) -> tuple[list[int], list[int], int]:
+    """Return per-class case presence, voxel counts, and total voxels."""
+    case_counts = [0] * num_classes
+    voxel_counts = [0] * num_classes
+    total_voxels = 0
+    for case_id in case_ids:
+        label_path = label_dir / f"{case_id}.nii.gz"
+        if not label_path.is_file():
+            raise FileNotFoundError(f"Missing label for class stats: {label_path}")
+        label = np.asanyarray(nib.load(str(label_path)).dataobj).astype(np.int64)
+        total_voxels += int(label.size)
+        vals, counts = np.unique(label, return_counts=True)
+        for raw_class_id, raw_count in zip(vals, counts):
+            class_id = int(raw_class_id)
+            if 0 <= class_id < num_classes:
+                case_counts[class_id] += 1
+                voxel_counts[class_id] += int(raw_count)
+    return case_counts, voxel_counts, total_voxels
+
+
+def _write_split_class_frequency_report(
+    *,
+    out_dir: Path,
+    label_dir: Path,
+    train_case_ids: list[str],
+    val_case_ids: list[str],
+    num_classes: int,
+    class_label_fn: Any,
+) -> Path:
+    """Write train/val class support and voxel-frequency diagnostics."""
+    train_case_counts, train_voxel_counts, train_total_voxels = _compute_split_class_stats(
+        label_dir=label_dir,
+        case_ids=train_case_ids,
+        num_classes=num_classes,
+    )
+    val_case_counts, val_voxel_counts, val_total_voxels = _compute_split_class_stats(
+        label_dir=label_dir,
+        case_ids=val_case_ids,
+        num_classes=num_classes,
+    )
+    report_path = out_dir / "class_frequency.csv"
+    with report_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "class_id",
+                "class_name",
+                "train_case_count",
+                "train_case_rate",
+                "train_voxels",
+                "train_voxel_rate",
+                "val_case_count",
+                "val_case_rate",
+                "val_voxels",
+                "val_voxel_rate",
+                "near_zero_support_flag",
+            ]
+        )
+        for class_id in range(num_classes):
+            train_case_rate = (
+                train_case_counts[class_id] / max(len(train_case_ids), 1)
+            )
+            val_case_rate = val_case_counts[class_id] / max(len(val_case_ids), 1)
+            train_voxel_rate = (
+                train_voxel_counts[class_id] / max(train_total_voxels, 1)
+            )
+            val_voxel_rate = val_voxel_counts[class_id] / max(val_total_voxels, 1)
+            near_zero = class_id > 0 and (
+                train_case_counts[class_id] == 0
+                or val_case_counts[class_id] == 0
+                or train_voxel_counts[class_id] == 0
+                or val_voxel_counts[class_id] == 0
+            )
+            writer.writerow(
+                [
+                    class_id,
+                    class_label_fn(class_id),
+                    train_case_counts[class_id],
+                    f"{train_case_rate:.6f}",
+                    train_voxel_counts[class_id],
+                    f"{train_voxel_rate:.10f}",
+                    val_case_counts[class_id],
+                    f"{val_case_rate:.6f}",
+                    val_voxel_counts[class_id],
+                    f"{val_voxel_rate:.10f}",
+                    int(near_zero),
+                ]
+            )
+    return report_path
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -1368,6 +1465,16 @@ def main() -> int:
         safe = name.replace(" ", "_").replace('"', "").strip("_") or f"class_{idx}"
         return safe
 
+    class_frequency_csv = _write_split_class_frequency_report(
+        out_dir=out_dir,
+        label_dir=label_dir,
+        train_case_ids=train_case_ids,
+        val_case_ids=val_case_ids,
+        num_classes=num_classes,
+        class_label_fn=_class_label,
+    )
+    print(f"Saved class frequency report: {class_frequency_csv}")
+
     # Only (re)write the CSV header if the file does not already contain data
     # rows. When resuming, we append so prior epoch history is preserved. A
     # header-only CSV is treated as empty so schema updates do not create
@@ -1395,6 +1502,22 @@ def main() -> int:
                     *[f"val_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     "val_mean_fg_dice",
                     "val_mean_fg_dice_all_cases_present",
+                    *[
+                        f"val_gt_support_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
+                    *[
+                        f"val_pred_support_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
+                    *[
+                        f"val_gt_voxels_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
+                    *[
+                        f"val_pred_voxels_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
                     *[
                         f"val_dice_c{c:02d}_{_class_label(c)}"
                         for c in range(num_classes)
@@ -1510,6 +1633,7 @@ def main() -> int:
             val_mean_fg_dice_all_cases_present,
             per_class_dice,
             val_components,
+            val_support,
         ) = validate_one_epoch(
             model=model,
             val_case_ids=val_case_ids,
@@ -1531,6 +1655,10 @@ def main() -> int:
         full_metrics = (
             topbrain_full_acc.finalize() if topbrain_full_acc is not None else empty_topbrain_metrics()
         )
+        val_gt_support = val_support["gt_case_counts"]
+        val_pred_support = val_support["pred_case_counts"]
+        val_gt_voxels = val_support["gt_voxel_counts"]
+        val_pred_voxels = val_support["pred_voxel_counts"]
 
         lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step()
@@ -1566,6 +1694,10 @@ def main() -> int:
                         if not np.isfinite(val_mean_fg_dice_all_cases_present)
                         else f"{val_mean_fg_dice_all_cases_present:.6f}"
                     ),
+                    *[str(count) for count in val_gt_support],
+                    *[str(count) for count in val_pred_support],
+                    *[str(count) for count in val_gt_voxels],
+                    *[str(count) for count in val_pred_voxels],
                     *[f"{d:.6f}" for d in per_class_dice],
                     *_topbrain_csv_values(
                         run_topbrain_this_epoch and bool(topbrain_subset_ids_set),
@@ -1641,6 +1773,35 @@ def main() -> int:
                 "lowest_hits="
                 + ", ".join(
                     f"{label}:{hit_count}" for hit_count, label in lowest_hit_classes
+                )
+            )
+        if len(val_case_ids) > 0:
+            val_absent_gt = [
+                f"c{idx:02d}_{_class_label(idx)}"
+                for idx, count in enumerate(val_gt_support)
+                if idx > 0 and count == 0
+            ]
+            val_never_predicted = [
+                f"c{idx:02d}_{_class_label(idx)}"
+                for idx, count in enumerate(val_pred_support)
+                if idx > 0 and count == 0
+            ]
+            low_gt_support = sorted(
+                (
+                    (count, f"c{idx:02d}_{_class_label(idx)}")
+                    for idx, count in enumerate(val_gt_support)
+                    if idx > 0
+                ),
+                key=lambda item: item[0],
+            )[:8]
+            print(
+                "validation_support: "
+                f"val_cases={len(val_case_ids)} "
+                f"absent_gt_fg={len(val_absent_gt)} "
+                f"never_predicted_fg={len(val_never_predicted)} "
+                "lowest_gt_support="
+                + ", ".join(
+                    f"{label}:{count}" for count, label in low_gt_support
                 )
             )
         print(
@@ -1725,6 +1886,39 @@ def main() -> int:
                 log_payload["val/mean_fg_dice_all_cases_present"] = float(
                     val_mean_fg_dice_all_cases_present
                 )
+            support_rows: list[list[Any]] = []
+            for idx in range(num_classes):
+                safe_name = _class_label(idx)
+                gt_cases = int(val_gt_support[idx])
+                pred_cases = int(val_pred_support[idx])
+                gt_voxels = int(val_gt_voxels[idx])
+                pred_voxels = int(val_pred_voxels[idx])
+                log_payload[f"val_gt_support_c{idx:02d}"] = gt_cases
+                log_payload[f"val_pred_support_c{idx:02d}"] = pred_cases
+                log_payload[f"val/support/gt_cases/{safe_name}"] = gt_cases
+                log_payload[f"val/support/pred_cases/{safe_name}"] = pred_cases
+                log_payload[f"val/support/gt_voxels/{safe_name}"] = gt_voxels
+                log_payload[f"val/support/pred_voxels/{safe_name}"] = pred_voxels
+                support_rows.append(
+                    [
+                        f"{idx:02d}_{safe_name}",
+                        gt_cases,
+                        pred_cases,
+                        gt_voxels,
+                        pred_voxels,
+                    ]
+                )
+            support_table = wandb.Table(
+                data=support_rows,
+                columns=[
+                    "class",
+                    "gt_cases",
+                    "pred_cases",
+                    "gt_voxels",
+                    "pred_voxels",
+                ],
+            )
+            log_payload["val/support/table"] = support_table
 
             # Per-class Dice: log as both flat scalars (auto line charts) and a
             # bar chart table keyed by class name so W&B renders a labelled
@@ -1839,6 +2033,7 @@ def main() -> int:
             _final_val_mean_fg_dice_all_cases_present,
             _final_per_class_dice,
             _final_val_components,
+            _final_val_support,
         ) = validate_one_epoch(
             model=model,
             val_case_ids=final_case_ids,

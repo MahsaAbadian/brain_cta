@@ -29,6 +29,11 @@ This file tracks what is already done, what is currently underway, and what stil
 - Added per-class Dice logging to console and `metrics.csv`.
 - Added present-only foreground Dice tracking in validation (plus `val_mean_fg_dice_all` diagnostic metric).
 - Added challenge-like local evaluation script `src/evaluate_challenge_like.py` for full-volume inference.
+- Added per-class training patch hit diagnostics to confirm rare/thin classes are sampled each epoch.
+- Added Part A metric diagnostics:
+  - per-class validation GT/prediction support counts per epoch
+  - train/val class-frequency report (`class_frequency.csv`)
+  - near-zero support flags for split-level class support
 
 ## In Progress
 
@@ -77,12 +82,12 @@ context to distinguish similar-looking vessel branches.
 
 ### A) Metric and diagnosis tasks
 
-- Add per-class "support" report per epoch:
-  - number of validation batches where GT class is present
-  - number of predicted-positive batches
+- Done: add per-class support report per epoch:
+  - number of validation cases where GT class is present
+  - number of validation cases where prediction is positive
   - helps separate true failure from class-absent artifacts.
-- Add class-frequency table for train and val splits side-by-side.
-- Flag classes with near-zero support to avoid over-interpreting noisy Dice.
+- Done: add class-frequency table for train and val splits side-by-side.
+- Done: flag classes with near-zero support to avoid over-interpreting noisy Dice.
 
 ### B) Data split and validation robustness
 
