@@ -463,6 +463,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop training after this many consecutive epochs without a "
+            "meaningful improvement in the monitored validation metric. "
+            "0 (default) disables early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum absolute improvement required to reset early-stopping "
+            "patience. Only used when --early-stop-patience > 0."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-monitor",
+        type=str,
+        choices=("val_mean_fg_dice", "val_thin_vessel_mean_dice"),
+        default="val_mean_fg_dice",
+        help="Validation metric monitored by early stopping.",
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -777,6 +803,19 @@ def _mean_dice_for_classes(
         if np.isfinite(value):
             scores.append(float(value))
     return float(sum(scores) / len(scores)) if scores else float("nan")
+
+
+def _is_metric_improved(
+    value: float,
+    best_value: float,
+    min_delta: float = 0.0,
+) -> bool:
+    """Return whether a higher-is-better metric improved by at least min_delta."""
+    if not np.isfinite(value):
+        return False
+    if not np.isfinite(best_value):
+        return True
+    return value > best_value + max(float(min_delta), 0.0)
 
 
 def _compute_split_class_stats(
@@ -1196,6 +1235,10 @@ def main() -> int:
         raise ValueError("--resume and --load-weights are mutually exclusive.")
     if args.load_weights is not None and not args.load_weights.is_file():
         raise FileNotFoundError(f"--load-weights file not found: {args.load_weights}")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be >= 0.")
+    if args.early_stop_min_delta < 0.0:
+        raise ValueError("--early-stop-min-delta must be >= 0.")
 
     cldice_class_ids = _parse_class_id_list(args.cldice_class_ids)
     rare_class_mode = _parse_rare_class_mode(args.rare_class_mode)
@@ -1445,6 +1488,15 @@ def main() -> int:
         print("warning: --amp ignored because device is not CUDA.")
     if amp_enabled:
         print(f"AMP enabled: dtype={args.amp_dtype} grad_scaler={scaler.is_enabled() if scaler else False}")
+    if args.early_stop_patience > 0:
+        print(
+            "early stopping enabled: "
+            f"monitor={args.early_stop_monitor} "
+            f"patience={args.early_stop_patience} "
+            f"min_delta={args.early_stop_min_delta:.6f}"
+        )
+    else:
+        print("early stopping disabled")
 
     topbrain_requested = not args.topbrain_disable
     topbrain_runtime = TopBrainRuntime(track=args.topbrain_track) if topbrain_requested else None
@@ -1517,6 +1569,10 @@ def main() -> int:
                     "train_loss",
                     "val_loss",
                     "train_grad_norm",
+                    "early_stop_monitor_value",
+                    "early_stop_best",
+                    "early_stop_bad_epochs",
+                    "early_stop_triggered",
                     "train_sampled_patches",
                     *[
                         f"train_patch_hit_c{c:02d}_{_class_label(c)}"
@@ -1554,7 +1610,11 @@ def main() -> int:
             )
 
     best_val_dice = -1.0
+    early_stop_best = float("-inf")
+    early_stop_bad_epochs = 0
+    early_stop_triggered = False
     start_epoch = 1
+    last_completed_epoch = start_epoch - 1
     final_weights_path = out_dir / "model_final_weights.pt"
     best_weights_path = out_dir / "model_best_weights.pt"
 
@@ -1586,6 +1646,8 @@ def main() -> int:
             device=device,
         )
         start_epoch = last_completed_epoch + 1
+        if args.early_stop_monitor == "val_mean_fg_dice":
+            early_stop_best = best_val_dice
         print(
             f"resumed from {args.resume}: "
             f"last_completed_epoch={last_completed_epoch} "
@@ -1706,6 +1768,24 @@ def main() -> int:
                 return ""
             return f"{value:.6f}"
 
+        early_stop_metric_value = (
+            val_thin_vessel_mean_dice
+            if args.early_stop_monitor == "val_thin_vessel_mean_dice"
+            else val_mean_fg_dice
+        )
+        early_stop_improved = _is_metric_improved(
+            early_stop_metric_value,
+            early_stop_best,
+            min_delta=args.early_stop_min_delta,
+        )
+        if args.early_stop_patience > 0:
+            if early_stop_improved:
+                early_stop_best = early_stop_metric_value
+                early_stop_bad_epochs = 0
+            else:
+                early_stop_bad_epochs += 1
+            early_stop_triggered = early_stop_bad_epochs >= args.early_stop_patience
+
         with metrics_csv.open("a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -1715,6 +1795,18 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     "" if not np.isfinite(train_grad_norm) else f"{train_grad_norm:.6f}",
+                    (
+                        ""
+                        if not np.isfinite(early_stop_metric_value)
+                        else f"{early_stop_metric_value:.6f}"
+                    ),
+                    (
+                        ""
+                        if not np.isfinite(early_stop_best)
+                        else f"{early_stop_best:.6f}"
+                    ),
+                    early_stop_bad_epochs,
+                    int(early_stop_triggered),
                     train_sampled_patches,
                     *[str(hit_count) for hit_count in train_patch_hits],
                     *[
@@ -1784,6 +1876,7 @@ def main() -> int:
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f}"
             f"{best_tag} "
             f"val_thin_vessel_mean_dice={val_thin_vessel_mean_dice:.6f} "
+            f"early_stop_bad_epochs={early_stop_bad_epochs} "
             "val_mean_fg_dice_all_cases_present="
             f"{val_mean_fg_dice_all_cases_present:.6f} "
             f"time={elapsed:.1f}s"
@@ -1902,7 +1995,11 @@ def main() -> int:
                 "val/thin_vessel_mean_dice": float(val_thin_vessel_mean_dice),
                 "val/best_mean_fg_dice": float(best_val_dice),
                 "train/sampled_patches": int(train_sampled_patches),
+                "train/early_stop_bad_epochs": int(early_stop_bad_epochs),
+                "train/early_stop_metric": float(early_stop_metric_value),
             }
+            if np.isfinite(early_stop_best):
+                log_payload["train/early_stop_best"] = float(early_stop_best)
             if np.isfinite(val_thin_vessel_mean_dice_supported):
                 log_payload["val_thin_vessel_mean_dice_supported"] = float(
                     val_thin_vessel_mean_dice_supported
@@ -2057,10 +2154,30 @@ def main() -> int:
             value = per_class_dice[c] if c < len(per_class_dice) else float("nan")
             history[f"val_dice_c{c:02d}"].append(float(value))
 
+        last_completed_epoch = epoch
+        if early_stop_triggered:
+            print(
+                "early stopping triggered: "
+                f"monitor={args.early_stop_monitor} "
+                f"best={early_stop_best:.6f} "
+                f"last={early_stop_metric_value:.6f} "
+                f"bad_epochs={early_stop_bad_epochs} "
+                f"patience={args.early_stop_patience}"
+            )
+            if wandb_run is not None:
+                wandb_run.summary["early_stopped"] = True
+                wandb_run.summary["early_stop_epoch"] = int(epoch)
+                wandb_run.summary["early_stop_monitor"] = args.early_stop_monitor
+            break
+
     final_epoch_ran_topbrain_full = (
         topbrain_enabled
         and args.topbrain_per_epoch
-        and should_run_topbrain_full_eval(args.epochs, args.topbrain_eval_every_n_epochs)
+        and last_completed_epoch >= start_epoch
+        and should_run_topbrain_full_eval(
+            last_completed_epoch,
+            args.topbrain_eval_every_n_epochs,
+        )
     )
     need_final_topbrain = topbrain_enabled and topbrain_runtime and (
         not args.topbrain_per_epoch or not final_epoch_ran_topbrain_full
@@ -2122,6 +2239,7 @@ def main() -> int:
     torch.save(model.state_dict(), final_weights_path)
     if wandb_run is not None:
         wandb_run.summary["best_val_mean_fg_dice"] = float(best_val_dice)
+        wandb_run.summary["early_stopped"] = bool(early_stop_triggered)
         _log_wandb_summary_charts(
             wandb_run=wandb_run,
             history=history,
@@ -2135,6 +2253,12 @@ def main() -> int:
         wandb_run.log_artifact(artifact)
         wandb_run.finish()
     print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
+    if early_stop_triggered:
+        print(
+            "Stopped early at epoch "
+            f"{last_completed_epoch} "
+            f"(monitor={args.early_stop_monitor}, patience={args.early_stop_patience})."
+        )
     print(f"Saved metrics: {metrics_csv}")
     print(f"Saved final weights: {final_weights_path}")
     if best_weights_path.is_file():

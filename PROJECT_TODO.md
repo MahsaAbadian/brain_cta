@@ -35,6 +35,7 @@ This file tracks what is already done, what is currently underway, and what stil
   - train/val class-frequency report (`class_frequency.csv`)
   - near-zero support flags for split-level class support
 - Added thin-vessel mean Dice summary metrics for the known failing group.
+- Added early stopping for faster experiment cycles when validation metrics plateau.
 
 ## In Progress
 
@@ -127,7 +128,7 @@ context to distinguish similar-looking vessel branches.
   per parameter without the overfitting cost of wider channels.
 - Test gradient accumulation to emulate larger batch behavior if GPU memory is tight.
 - Tune LR schedule/warmup for stability on rare classes.
-- Add early-stop-on-plateau logic for faster iteration cycles.
+- Done: add early-stop-on-plateau logic for faster iteration cycles.
 
 ### F) Inference and post-processing
 

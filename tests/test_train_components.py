@@ -8,6 +8,7 @@ from train import (
     DiceCELoss,
     _compute_split_class_stats,
     _count_patch_class_hits,
+    _is_metric_improved,
     _mean_dice_for_classes,
 )
 
@@ -81,3 +82,11 @@ def test_mean_dice_for_classes_can_require_support() -> None:
         (1, 2, 3),
         support_counts=support,
     ) == 0.30000000000000004
+
+
+def test_is_metric_improved_respects_min_delta_and_nan() -> None:
+    assert _is_metric_improved(0.51, 0.50, min_delta=0.0)
+    assert _is_metric_improved(0.52, 0.50, min_delta=0.01)
+    assert not _is_metric_improved(0.505, 0.50, min_delta=0.01)
+    assert not _is_metric_improved(float("nan"), 0.50, min_delta=0.0)
+    assert _is_metric_improved(0.10, float("-inf"), min_delta=0.0)
