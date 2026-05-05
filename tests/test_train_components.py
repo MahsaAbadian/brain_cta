@@ -4,7 +4,12 @@ import torch
 import nibabel as nib
 import numpy as np
 
-from train import DiceCELoss, _compute_split_class_stats, _count_patch_class_hits
+from train import (
+    DiceCELoss,
+    _compute_split_class_stats,
+    _count_patch_class_hits,
+    _mean_dice_for_classes,
+)
 
 
 def test_dice_ce_loss_forward_and_backward() -> None:
@@ -64,3 +69,15 @@ def test_compute_split_class_stats_counts_cases_and_voxels(tmp_path) -> None:
     assert total_voxels == 8
     assert case_counts == [2, 1, 2, 0]
     assert voxel_counts == [3, 2, 3, 0]
+
+
+def test_mean_dice_for_classes_can_require_support() -> None:
+    per_class_dice = [0.9, 0.2, 0.4, 1.0]
+    support = [2, 1, 1, 0]
+
+    assert _mean_dice_for_classes(per_class_dice, (1, 2, 3)) == 0.5333333333333333
+    assert _mean_dice_for_classes(
+        per_class_dice,
+        (1, 2, 3),
+        support_counts=support,
+    ) == 0.30000000000000004

@@ -34,6 +34,7 @@ This file tracks what is already done, what is currently underway, and what stil
   - per-class validation GT/prediction support counts per epoch
   - train/val class-frequency report (`class_frequency.csv`)
   - near-zero support flags for split-level class support
+- Added thin-vessel mean Dice summary metrics for the known failing group.
 
 ## In Progress
 
@@ -210,7 +211,7 @@ below are ordered roughly from easiest to hardest to implement.
   are averaged over more patients and left-right asymmetry noise is reduced.
 - Report per-class Dice with the number of val patients where GT was present alongside it,
   so fake 1.0 scores are immediately visible.
-- Add a "thin vessel mean Dice" summary metric = mean Dice over {c02, c03, c04, c06, c10,
+- Done: add a "thin vessel mean Dice" summary metric = mean Dice over {c02, c03, c04, c06, c10,
   c11, c12, c23, c25} only — the group that is currently failing — to track improvement
   specifically for these structures.
 

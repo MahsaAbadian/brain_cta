@@ -43,6 +43,9 @@ from topbrain_validation import (
 from validation import validate_one_epoch
 
 
+THIN_VESSEL_CLASS_IDS: tuple[int, ...] = (2, 3, 4, 6, 10, 11, 12, 23, 25)
+
+
 def _parse_class_id_list(raw: str | None) -> tuple[int, ...] | None:
     if raw is None:
         return None
@@ -757,6 +760,25 @@ def _count_patch_class_hits(
     return hits, int(labels.shape[0])
 
 
+def _mean_dice_for_classes(
+    per_class_dice: list[float],
+    class_ids: tuple[int, ...],
+    support_counts: list[int] | None = None,
+) -> float:
+    """Average per-class Dice over selected classes, optionally requiring support."""
+    scores: list[float] = []
+    for class_id in class_ids:
+        if class_id < 0 or class_id >= len(per_class_dice):
+            continue
+        if support_counts is not None:
+            if class_id >= len(support_counts) or support_counts[class_id] <= 0:
+                continue
+        value = per_class_dice[class_id]
+        if np.isfinite(value):
+            scores.append(float(value))
+    return float(sum(scores) / len(scores)) if scores else float("nan")
+
+
 def _compute_split_class_stats(
     *,
     label_dir: Path,
@@ -1220,6 +1242,8 @@ def main() -> int:
         # Highlight which scalars should drive the "best" summary panel.
         wandb_run.define_metric("val/mean_fg_dice", summary="max")
         wandb_run.define_metric("val_mean_fg_dice", summary="max")
+        wandb_run.define_metric("val/thin_vessel_mean_dice", summary="max")
+        wandb_run.define_metric("val_thin_vessel_mean_dice", summary="max")
         wandb_run.define_metric("val/loss_total", summary="min")
         wandb_run.define_metric("train/loss_total", summary="min")
         print(
@@ -1502,6 +1526,8 @@ def main() -> int:
                     *[f"val_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     "val_mean_fg_dice",
                     "val_mean_fg_dice_all_cases_present",
+                    "val_thin_vessel_mean_dice",
+                    "val_thin_vessel_mean_dice_supported",
                     *[
                         f"val_gt_support_c{c:02d}_{_class_label(c)}"
                         for c in range(num_classes)
@@ -1541,6 +1567,8 @@ def main() -> int:
         "train_loss": [],
         "val_loss": [],
         "val_mean_fg_dice": [],
+        "val_thin_vessel_mean_dice": [],
+        "val_thin_vessel_mean_dice_supported": [],
     }
     for name in DiceCELoss.COMPONENT_NAMES:
         history[f"train_loss_{name}"] = []
@@ -1659,6 +1687,15 @@ def main() -> int:
         val_pred_support = val_support["pred_case_counts"]
         val_gt_voxels = val_support["gt_voxel_counts"]
         val_pred_voxels = val_support["pred_voxel_counts"]
+        val_thin_vessel_mean_dice = _mean_dice_for_classes(
+            per_class_dice,
+            THIN_VESSEL_CLASS_IDS,
+        )
+        val_thin_vessel_mean_dice_supported = _mean_dice_for_classes(
+            per_class_dice,
+            THIN_VESSEL_CLASS_IDS,
+            support_counts=val_gt_support,
+        )
 
         lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step()
@@ -1693,6 +1730,16 @@ def main() -> int:
                         ""
                         if not np.isfinite(val_mean_fg_dice_all_cases_present)
                         else f"{val_mean_fg_dice_all_cases_present:.6f}"
+                    ),
+                    (
+                        ""
+                        if not np.isfinite(val_thin_vessel_mean_dice)
+                        else f"{val_thin_vessel_mean_dice:.6f}"
+                    ),
+                    (
+                        ""
+                        if not np.isfinite(val_thin_vessel_mean_dice_supported)
+                        else f"{val_thin_vessel_mean_dice_supported:.6f}"
                     ),
                     *[str(count) for count in val_gt_support],
                     *[str(count) for count in val_pred_support],
@@ -1736,6 +1783,7 @@ def main() -> int:
             f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f}"
             f"{best_tag} "
+            f"val_thin_vessel_mean_dice={val_thin_vessel_mean_dice:.6f} "
             "val_mean_fg_dice_all_cases_present="
             f"{val_mean_fg_dice_all_cases_present:.6f} "
             f"time={elapsed:.1f}s"
@@ -1844,15 +1892,24 @@ def main() -> int:
                 "train_loss": float(train_loss),
                 "val_loss": float(val_loss),
                 "val_mean_fg_dice": float(val_mean_fg_dice),
+                "val_thin_vessel_mean_dice": float(val_thin_vessel_mean_dice),
                 # Namespaced metrics give clean per-section dashboards:
                 #   train/loss_*  vs  val/loss_*    (train-vs-val overlay)
                 #   val/dice/class/<name>           (per-class dice)
                 "train/loss_total": float(train_loss),
                 "val/loss_total": float(val_loss),
                 "val/mean_fg_dice": float(val_mean_fg_dice),
+                "val/thin_vessel_mean_dice": float(val_thin_vessel_mean_dice),
                 "val/best_mean_fg_dice": float(best_val_dice),
                 "train/sampled_patches": int(train_sampled_patches),
             }
+            if np.isfinite(val_thin_vessel_mean_dice_supported):
+                log_payload["val_thin_vessel_mean_dice_supported"] = float(
+                    val_thin_vessel_mean_dice_supported
+                )
+                log_payload["val/thin_vessel_mean_dice_supported"] = float(
+                    val_thin_vessel_mean_dice_supported
+                )
             patch_hit_rows: list[list[Any]] = []
             for idx, hit_count in enumerate(train_patch_hits):
                 safe_name = _class_label(idx)
@@ -1985,6 +2042,10 @@ def main() -> int:
         history["train_loss"].append(float(train_loss))
         history["val_loss"].append(float(val_loss))
         history["val_mean_fg_dice"].append(float(val_mean_fg_dice))
+        history["val_thin_vessel_mean_dice"].append(float(val_thin_vessel_mean_dice))
+        history["val_thin_vessel_mean_dice_supported"].append(
+            float(val_thin_vessel_mean_dice_supported)
+        )
         for name in DiceCELoss.COMPONENT_NAMES:
             history[f"train_loss_{name}"].append(
                 float(train_components.get(name, float("nan")))
