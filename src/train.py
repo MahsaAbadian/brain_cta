@@ -155,6 +155,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--num-patches-per-volume", type=int, default=2)
     parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help=(
+            "Accumulate gradients across this many loader batches before each "
+            "optimizer step. 1 (default) preserves standard training."
+        ),
+    )
+    parser.add_argument(
         "--val-stride",
         type=int,
         nargs=3,
@@ -818,6 +827,39 @@ def _is_metric_improved(
     return value > best_value + max(float(min_delta), 0.0)
 
 
+def _should_step_optimizer(
+    batch_index: int,
+    total_batches: int,
+    grad_accum_steps: int,
+) -> bool:
+    """Return whether the current 1-based batch should trigger optimizer.step."""
+    if batch_index <= 0:
+        raise ValueError(f"batch_index must be 1-based and > 0, got {batch_index}")
+    if total_batches <= 0:
+        raise ValueError(f"total_batches must be > 0, got {total_batches}")
+    if grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be > 0, got {grad_accum_steps}")
+    return batch_index % grad_accum_steps == 0 or batch_index == total_batches
+
+
+def _grad_accum_divisor(
+    batch_index: int,
+    total_batches: int,
+    grad_accum_steps: int,
+) -> int:
+    """Return the divisor for the current accumulation window."""
+    if batch_index <= 0:
+        raise ValueError(f"batch_index must be 1-based and > 0, got {batch_index}")
+    if total_batches <= 0:
+        raise ValueError(f"total_batches must be > 0, got {total_batches}")
+    if grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be > 0, got {grad_accum_steps}")
+    tail = total_batches % grad_accum_steps
+    if tail and batch_index > total_batches - tail:
+        return tail
+    return grad_accum_steps
+
+
 def _compute_split_class_stats(
     *,
     label_dir: Path,
@@ -1018,15 +1060,19 @@ def train_one_epoch(
     device: torch.device,
     scaler: torch.amp.GradScaler | None = None,
     amp_dtype: torch.dtype | None = None,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     """Train for one epoch and return per-component and aggregate statistics.
 
-    Returned dict always contains ``total`` (mean optimization loss) and
-    ``grad_norm`` (mean L2 gradient norm across steps). When the criterion
-    exposes ``forward_components``, the dict also contains per-term losses
-    keyed by ``ce``, ``dice``, ``tversky``, ``cldice`` so that W&B/CSV can
-    track each loss curve individually.
+    Returned dict always contains ``total`` (mean unscaled optimization loss),
+    ``grad_norm`` (mean L2 gradient norm across optimizer steps), and
+    ``optimizer_steps``. When the criterion exposes ``forward_components``,
+    the dict also contains per-term losses keyed by ``ce``, ``dice``,
+    ``tversky``, ``cldice`` so that W&B/CSV can track each loss curve
+    individually.
     """
+    if grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be > 0, got {grad_accum_steps}")
     ds_base_weights = torch.tensor(
         [1.0, 0.5, 0.25, 0.125], dtype=torch.float32, device=device
     )
@@ -1099,11 +1145,14 @@ def train_one_epoch(
     running_grad_norm = 0.0
     component_sums: dict[str, float] = {}
     n_steps = 0
+    n_optimizer_steps = 0
     num_classes = int(getattr(criterion, "num_classes", 0) or 0)
     patch_hit_counts = [0] * num_classes
     sampled_patch_count = 0
     use_amp = scaler is not None and amp_dtype is not None and device.type == "cuda"
-    for batch in loader:
+    total_batches = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+    for batch_idx, batch in enumerate(loader, start=1):
         batch_skel = None
         if len(batch) == 4:
             batch_x, batch_y, batch_skel, _ = batch
@@ -1123,28 +1172,49 @@ def train_one_epoch(
         if batch_skel is not None:
             batch_skel = batch_skel.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
+        should_step = _should_step_optimizer(
+            batch_idx,
+            total_batches,
+            grad_accum_steps,
+        )
+        accum_divisor = _grad_accum_divisor(
+            batch_idx,
+            total_batches,
+            grad_accum_steps,
+        )
         if use_amp:
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                 logits = model(batch_x)
                 loss = _multiscale_loss(logits, batch_y, batch_skel)
-            scaler.scale(loss).backward()
-            # Unscale before computing the real-scale gradient norm so the
-            # value we log matches the step actually applied.
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float("inf")
-            )
-            scaler.step(optimizer)
-            scaler.update()
+                backward_loss = loss / accum_divisor
+            scaler.scale(backward_loss).backward()
+            if should_step:
+                # Unscale before computing the real-scale gradient norm so the
+                # value we log matches the step actually applied.
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=float("inf")
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if torch.isfinite(grad_norm):
+                    running_grad_norm += float(grad_norm.item())
+                n_optimizer_steps += 1
         else:
             logits = model(batch_x)
             loss = _multiscale_loss(logits, batch_y, batch_skel)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float("inf")
-            )
-            optimizer.step()
+            backward_loss = loss / accum_divisor
+            backward_loss.backward()
+            if should_step:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=float("inf")
+                )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if torch.isfinite(grad_norm):
+                    running_grad_norm += float(grad_norm.item())
+                n_optimizer_steps += 1
 
         if supports_components:
             with torch.no_grad():
@@ -1157,15 +1227,16 @@ def train_one_epoch(
                 )
 
         running_loss += float(loss.item())
-        if torch.isfinite(grad_norm):
-            running_grad_norm += float(grad_norm.item())
         n_steps += 1
 
     divisor = max(n_steps, 1)
+    optimizer_divisor = max(n_optimizer_steps, 1)
     stats: dict[str, float] = {
         "total": running_loss / divisor,
-        "grad_norm": running_grad_norm / divisor,
+        "grad_norm": running_grad_norm / optimizer_divisor,
         "sampled_patches": float(sampled_patch_count),
+        "optimizer_steps": float(n_optimizer_steps),
+        "grad_accum_steps": float(grad_accum_steps),
     }
     for name, total in component_sums.items():
         stats[name] = total / divisor
@@ -1235,6 +1306,8 @@ def main() -> int:
         raise ValueError("--resume and --load-weights are mutually exclusive.")
     if args.load_weights is not None and not args.load_weights.is_file():
         raise FileNotFoundError(f"--load-weights file not found: {args.load_weights}")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("--grad-accum-steps must be > 0.")
     if args.early_stop_patience < 0:
         raise ValueError("--early-stop-patience must be >= 0.")
     if args.early_stop_min_delta < 0.0:
@@ -1348,6 +1421,11 @@ def main() -> int:
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
         f"val_stride={val_stride} train_batches={len(train_loader)} val_cases={len(val_case_ids)}"
+    )
+    print(
+        "gradient accumulation: "
+        f"steps={args.grad_accum_steps} "
+        f"effective_volume_batch={args.batch_size * args.grad_accum_steps}"
     )
     print(
         "rare-class sampling: "
@@ -1569,6 +1647,8 @@ def main() -> int:
                     "train_loss",
                     "val_loss",
                     "train_grad_norm",
+                    "train_optimizer_steps",
+                    "grad_accum_steps",
                     "early_stop_monitor_value",
                     "early_stop_best",
                     "early_stop_bad_epochs",
@@ -1704,9 +1784,11 @@ def main() -> int:
             device=device,
             scaler=scaler,
             amp_dtype=amp_dtype if amp_enabled else None,
+            grad_accum_steps=args.grad_accum_steps,
         )
         train_loss = train_stats["total"]
         train_grad_norm = train_stats.get("grad_norm", float("nan"))
+        train_optimizer_steps = int(train_stats.get("optimizer_steps", 0.0))
         train_sampled_patches = int(train_stats.get("sampled_patches", 0.0))
         train_patch_hits = [
             int(train_stats.get(f"patch_hit_c{class_id:02d}", 0.0))
@@ -1795,6 +1877,8 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     "" if not np.isfinite(train_grad_norm) else f"{train_grad_norm:.6f}",
+                    train_optimizer_steps,
+                    args.grad_accum_steps,
                     (
                         ""
                         if not np.isfinite(early_stop_metric_value)
@@ -1872,6 +1956,7 @@ def main() -> int:
         print(
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
             f"lr={lr:.2e} grad_norm={train_grad_norm:.3f} "
+            f"optim_steps={train_optimizer_steps} "
             f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f}"
             f"{best_tag} "
@@ -1981,6 +2066,8 @@ def main() -> int:
                 "time/epoch_sec": float(elapsed),
                 "optim/lr": float(lr),
                 "optim/grad_norm": float(train_grad_norm),
+                "optim/steps_per_epoch": int(train_optimizer_steps),
+                "optim/grad_accum_steps": int(args.grad_accum_steps),
                 # Top-level mirrors so the summary panel picks them up by default.
                 "train_loss": float(train_loss),
                 "val_loss": float(val_loss),

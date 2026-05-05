@@ -36,6 +36,7 @@ This file tracks what is already done, what is currently underway, and what stil
   - near-zero support flags for split-level class support
 - Added thin-vessel mean Dice summary metrics for the known failing group.
 - Added early stopping for faster experiment cycles when validation metrics plateau.
+- Added gradient accumulation support for larger effective batches under GPU memory limits.
 
 ## In Progress
 
@@ -126,7 +127,7 @@ context to distinguish similar-looking vessel branches.
   parameters overfit the small dataset and rare classes especially suffer).
 - Try residual blocks inside `ConvBlock3D` (see Thin Vessel Plan section G) — more capacity
   per parameter without the overfitting cost of wider channels.
-- Test gradient accumulation to emulate larger batch behavior if GPU memory is tight.
+- Done: add gradient accumulation to emulate larger batch behavior if GPU memory is tight.
 - Tune LR schedule/warmup for stability on rare classes.
 - Done: add early-stop-on-plateau logic for faster iteration cycles.
 

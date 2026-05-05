@@ -8,8 +8,10 @@ from train import (
     DiceCELoss,
     _compute_split_class_stats,
     _count_patch_class_hits,
+    _grad_accum_divisor,
     _is_metric_improved,
     _mean_dice_for_classes,
+    _should_step_optimizer,
 )
 
 
@@ -90,3 +92,20 @@ def test_is_metric_improved_respects_min_delta_and_nan() -> None:
     assert not _is_metric_improved(0.505, 0.50, min_delta=0.01)
     assert not _is_metric_improved(float("nan"), 0.50, min_delta=0.0)
     assert _is_metric_improved(0.10, float("-inf"), min_delta=0.0)
+
+
+def test_should_step_optimizer_handles_accumulation_tail() -> None:
+    step_batches = [
+        idx
+        for idx in range(1, 6)
+        if _should_step_optimizer(idx, total_batches=5, grad_accum_steps=2)
+    ]
+    assert step_batches == [2, 4, 5]
+
+
+def test_grad_accum_divisor_uses_tail_window_size() -> None:
+    divisors = [
+        _grad_accum_divisor(idx, total_batches=5, grad_accum_steps=2)
+        for idx in range(1, 6)
+    ]
+    assert divisors == [2, 2, 2, 2, 1]
