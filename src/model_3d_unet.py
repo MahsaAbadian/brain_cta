@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from experimental.connectivity_arch import NexToUBlock, LungAirwayConnectivityModule
 
 
 class ConvBlock3D(nn.Module):
@@ -71,6 +72,8 @@ class UNet3D(nn.Module):
         use_checkpoint: bool = False,
         deep_supervision: bool = False,
         residual_blocks: bool = False,
+        use_nextou: bool = False,
+        use_airway_connectivity: bool = False,
     ):
         super().__init__()
         # When enabled, encoder/decoder ConvBlocks are run via
@@ -99,6 +102,13 @@ class UNet3D(nn.Module):
 
         # Bottleneck
         self.bottleneck = block_cls(base_ch * 8, base_ch * 16)
+        
+        self.use_nextou = use_nextou
+        self.use_airway_connectivity = use_airway_connectivity
+        if self.use_nextou:
+            self.nextou_block = NexToUBlock(base_ch * 16, base_ch * 16)
+        if self.use_airway_connectivity:
+            self.airway_block = LungAirwayConnectivityModule(base_ch * 16)
 
         # Decoder (transpose conv upsample + skip concat + conv block)
         self.up4 = nn.ConvTranspose3d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
@@ -149,6 +159,10 @@ class UNet3D(nn.Module):
         e4 = self._run_block(self.enc4, self.pool3(e3))
 
         b = self._run_block(self.bottleneck, self.pool4(e4))
+        if self.use_nextou:
+            b = self.nextou_block(b)
+        if self.use_airway_connectivity:
+            b = self.airway_block(b)
 
         # Decoder path mirrors the encoder and fuses skip features at each scale.
         d4 = self.up4(b)

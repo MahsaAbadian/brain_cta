@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from experimental.topology_losses import SkelRecallLoss, cbDiceLoss, CASLoss
 
 
 class DiceCELoss(nn.Module):
@@ -25,6 +26,9 @@ class DiceCELoss(nn.Module):
         eps: float = 1e-6,
         ce_class_weights: torch.Tensor | None = None,
         cldice_channel_chunk: int = 0,
+        skelrecall_weight: float = 0.0,
+        cbdice_weight: float = 0.0,
+        cas_weight: float = 0.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -39,6 +43,14 @@ class DiceCELoss(nn.Module):
         self.cldice_class_ids = cldice_class_ids
         self.include_background = include_background
         self.eps = eps
+        
+        self.skelrecall_weight = skelrecall_weight
+        self.cbdice_weight = cbdice_weight
+        self.cas_weight = cas_weight
+        
+        self.skelrecall_fn = SkelRecallLoss(eps=eps) if skelrecall_weight > 0 else None
+        self.cbdice_fn = cbDiceLoss(cldice_iters=cldice_iters, eps=eps) if cbdice_weight > 0 else None
+        self.cas_fn = CASLoss() if cas_weight > 0 else None
         if tversky_alpha < 0.0 or tversky_beta < 0.0:
             raise ValueError(
                 f"tversky_alpha and tversky_beta must be >= 0; got {tversky_alpha}, {tversky_beta}"
@@ -236,7 +248,7 @@ class DiceCELoss(nn.Module):
 
     # Names of the individual loss components exposed by forward_components.
     # Ordered so callers can iterate deterministically.
-    COMPONENT_NAMES: tuple[str, ...] = ("ce", "dice", "tversky", "cldice")
+    COMPONENT_NAMES: tuple[str, ...] = ("ce", "dice", "tversky", "cldice", "skelrecall", "cbdice", "cas")
 
     def forward(
         self,
@@ -288,17 +300,39 @@ class DiceCELoss(nn.Module):
             if self.cldice_weight > 0.0
             else torch.zeros((), dtype=logits.dtype, device=logits.device)
         )
+        
+        skelrecall_loss = (
+            self.skelrecall_fn(probs, target_skel) 
+            if self.skelrecall_weight > 0.0 and target_skel is not None
+            else torch.zeros((), dtype=logits.dtype, device=logits.device)
+        )
+        cbdice_loss = (
+            self.cbdice_fn(probs, target_1h, target_skel)
+            if self.cbdice_weight > 0.0 and target_skel is not None
+            else torch.zeros((), dtype=logits.dtype, device=logits.device)
+        )
+        cas_loss = (
+            self.cas_fn(probs, target_1h)
+            if self.cas_weight > 0.0
+            else torch.zeros((), dtype=logits.dtype, device=logits.device)
+        )
 
         total = (
             self.ce_weight * ce_loss
             + self.dice_weight * dice_loss
             + self.tversky_weight * tversky_loss
             + self.cldice_weight * cldice_loss
+            + self.skelrecall_weight * skelrecall_loss
+            + self.cbdice_weight * cbdice_loss
+            + self.cas_weight * cas_loss
         )
         components = {
             "ce": ce_loss,
             "dice": dice_loss,
             "tversky": tversky_loss,
             "cldice": cldice_loss,
+            "skelrecall": skelrecall_loss,
+            "cbdice": cbdice_loss,
+            "cas": cas_loss,
         }
         return total, components

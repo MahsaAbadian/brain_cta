@@ -296,6 +296,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skelrecall-weight",
+        type=float,
+        default=0.0,
+        help="Weight for SkelRecall loss.",
+    )
+    parser.add_argument(
+        "--cbdice-weight",
+        type=float,
+        default=0.0,
+        help="Weight for cbDice loss.",
+    )
+    parser.add_argument(
+        "--cas-weight",
+        type=float,
+        default=0.0,
+        help="Weight for CAS (Connectivity-Aware Surrogate) loss.",
+    )
+    parser.add_argument(
+        "--use-nextou",
+        action="store_true",
+        help="Enable NexToUBlock in the UNet bottleneck.",
+    )
+    parser.add_argument(
+        "--use-airway-connectivity",
+        action="store_true",
+        help="Enable LungAirwayConnectivityModule in the UNet bottleneck.",
+    )
+    parser.add_argument(
         "--ce-weight-min",
         type=float,
         default=None,
@@ -1214,6 +1242,8 @@ def main() -> int:
         use_checkpoint=bool(args.grad_checkpoint),
         deep_supervision=bool(args.deep_supervision),
         residual_blocks=bool(args.residual_blocks),
+        use_nextou=bool(args.use_nextou),
+        use_airway_connectivity=bool(args.use_airway_connectivity),
     ).to(device)
     if args.load_weights is not None:
         _load_model_weights(args.load_weights, model=model, device=device)
@@ -1249,6 +1279,9 @@ def main() -> int:
         include_background=False,
         ce_class_weights=ce_weights,
         cldice_channel_chunk=args.cldice_channel_chunk,
+        skelrecall_weight=args.skelrecall_weight,
+        cbdice_weight=args.cbdice_weight,
+        cas_weight=args.cas_weight,
     )
     if target_skeleton_dir is not None:
         expected_class_ids = _resolve_expected_cldice_class_ids(
