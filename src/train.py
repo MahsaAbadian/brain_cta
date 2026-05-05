@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
+import nibabel as nib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -40,6 +41,9 @@ from topbrain_validation import (
     should_run_topbrain_full_eval,
 )
 from validation import validate_one_epoch
+
+
+THIN_VESSEL_CLASS_IDS: tuple[int, ...] = (2, 3, 4, 6, 10, 11, 12, 23, 25)
 
 
 def _parse_class_id_list(raw: str | None) -> tuple[int, ...] | None:
@@ -150,6 +154,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--patch-size", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--num-patches-per-volume", type=int, default=2)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help=(
+            "Accumulate gradients across this many loader batches before each "
+            "optimizer step. 1 (default) preserves standard training."
+        ),
+    )
     parser.add_argument(
         "--val-stride",
         type=int,
@@ -459,6 +472,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop training after this many consecutive epochs without a "
+            "meaningful improvement in the monitored validation metric. "
+            "0 (default) disables early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum absolute improvement required to reset early-stopping "
+            "patience. Only used when --early-stop-patience > 0."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-monitor",
+        type=str,
+        choices=("val_mean_fg_dice", "val_thin_vessel_mean_dice"),
+        default="val_mean_fg_dice",
+        help="Validation metric monitored by early stopping.",
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -736,6 +775,187 @@ def _topbrain_csv_values(ran: bool, metrics: dict[str, float]) -> list[str]:
     return values
 
 
+def _count_patch_class_hits(
+    labels: torch.Tensor,
+    num_classes: int,
+) -> tuple[list[int], int]:
+    """Count how many sampled patches contain each class at least once."""
+    if labels.ndim < 2:
+        raise ValueError(
+            f"Expected labels with patch and spatial dims, got shape {tuple(labels.shape)}"
+        )
+    hits = [0] * num_classes
+    flat = labels.detach().reshape(labels.shape[0], -1).cpu()
+    for patch_labels in flat:
+        present = torch.unique(patch_labels)
+        for raw_class_id in present.tolist():
+            class_id = int(raw_class_id)
+            if 0 <= class_id < num_classes:
+                hits[class_id] += 1
+    return hits, int(labels.shape[0])
+
+
+def _mean_dice_for_classes(
+    per_class_dice: list[float],
+    class_ids: tuple[int, ...],
+    support_counts: list[int] | None = None,
+) -> float:
+    """Average per-class Dice over selected classes, optionally requiring support."""
+    scores: list[float] = []
+    for class_id in class_ids:
+        if class_id < 0 or class_id >= len(per_class_dice):
+            continue
+        if support_counts is not None:
+            if class_id >= len(support_counts) or support_counts[class_id] <= 0:
+                continue
+        value = per_class_dice[class_id]
+        if np.isfinite(value):
+            scores.append(float(value))
+    return float(sum(scores) / len(scores)) if scores else float("nan")
+
+
+def _is_metric_improved(
+    value: float,
+    best_value: float,
+    min_delta: float = 0.0,
+) -> bool:
+    """Return whether a higher-is-better metric improved by at least min_delta."""
+    if not np.isfinite(value):
+        return False
+    if not np.isfinite(best_value):
+        return True
+    return value > best_value + max(float(min_delta), 0.0)
+
+
+def _should_step_optimizer(
+    batch_index: int,
+    total_batches: int,
+    grad_accum_steps: int,
+) -> bool:
+    """Return whether the current 1-based batch should trigger optimizer.step."""
+    if batch_index <= 0:
+        raise ValueError(f"batch_index must be 1-based and > 0, got {batch_index}")
+    if total_batches <= 0:
+        raise ValueError(f"total_batches must be > 0, got {total_batches}")
+    if grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be > 0, got {grad_accum_steps}")
+    return batch_index % grad_accum_steps == 0 or batch_index == total_batches
+
+
+def _grad_accum_divisor(
+    batch_index: int,
+    total_batches: int,
+    grad_accum_steps: int,
+) -> int:
+    """Return the divisor for the current accumulation window."""
+    if batch_index <= 0:
+        raise ValueError(f"batch_index must be 1-based and > 0, got {batch_index}")
+    if total_batches <= 0:
+        raise ValueError(f"total_batches must be > 0, got {total_batches}")
+    if grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be > 0, got {grad_accum_steps}")
+    tail = total_batches % grad_accum_steps
+    if tail and batch_index > total_batches - tail:
+        return tail
+    return grad_accum_steps
+
+
+def _compute_split_class_stats(
+    *,
+    label_dir: Path,
+    case_ids: list[str],
+    num_classes: int,
+) -> tuple[list[int], list[int], int]:
+    """Return per-class case presence, voxel counts, and total voxels."""
+    case_counts = [0] * num_classes
+    voxel_counts = [0] * num_classes
+    total_voxels = 0
+    for case_id in case_ids:
+        label_path = label_dir / f"{case_id}.nii.gz"
+        if not label_path.is_file():
+            raise FileNotFoundError(f"Missing label for class stats: {label_path}")
+        label = np.asanyarray(nib.load(str(label_path)).dataobj).astype(np.int64)
+        total_voxels += int(label.size)
+        vals, counts = np.unique(label, return_counts=True)
+        for raw_class_id, raw_count in zip(vals, counts):
+            class_id = int(raw_class_id)
+            if 0 <= class_id < num_classes:
+                case_counts[class_id] += 1
+                voxel_counts[class_id] += int(raw_count)
+    return case_counts, voxel_counts, total_voxels
+
+
+def _write_split_class_frequency_report(
+    *,
+    out_dir: Path,
+    label_dir: Path,
+    train_case_ids: list[str],
+    val_case_ids: list[str],
+    num_classes: int,
+    class_label_fn: Any,
+) -> Path:
+    """Write train/val class support and voxel-frequency diagnostics."""
+    train_case_counts, train_voxel_counts, train_total_voxels = _compute_split_class_stats(
+        label_dir=label_dir,
+        case_ids=train_case_ids,
+        num_classes=num_classes,
+    )
+    val_case_counts, val_voxel_counts, val_total_voxels = _compute_split_class_stats(
+        label_dir=label_dir,
+        case_ids=val_case_ids,
+        num_classes=num_classes,
+    )
+    report_path = out_dir / "class_frequency.csv"
+    with report_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "class_id",
+                "class_name",
+                "train_case_count",
+                "train_case_rate",
+                "train_voxels",
+                "train_voxel_rate",
+                "val_case_count",
+                "val_case_rate",
+                "val_voxels",
+                "val_voxel_rate",
+                "near_zero_support_flag",
+            ]
+        )
+        for class_id in range(num_classes):
+            train_case_rate = (
+                train_case_counts[class_id] / max(len(train_case_ids), 1)
+            )
+            val_case_rate = val_case_counts[class_id] / max(len(val_case_ids), 1)
+            train_voxel_rate = (
+                train_voxel_counts[class_id] / max(train_total_voxels, 1)
+            )
+            val_voxel_rate = val_voxel_counts[class_id] / max(val_total_voxels, 1)
+            near_zero = class_id > 0 and (
+                train_case_counts[class_id] == 0
+                or val_case_counts[class_id] == 0
+                or train_voxel_counts[class_id] == 0
+                or val_voxel_counts[class_id] == 0
+            )
+            writer.writerow(
+                [
+                    class_id,
+                    class_label_fn(class_id),
+                    train_case_counts[class_id],
+                    f"{train_case_rate:.6f}",
+                    train_voxel_counts[class_id],
+                    f"{train_voxel_rate:.10f}",
+                    val_case_counts[class_id],
+                    f"{val_case_rate:.6f}",
+                    val_voxel_counts[class_id],
+                    f"{val_voxel_rate:.10f}",
+                    int(near_zero),
+                ]
+            )
+    return report_path
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -840,15 +1060,19 @@ def train_one_epoch(
     device: torch.device,
     scaler: torch.amp.GradScaler | None = None,
     amp_dtype: torch.dtype | None = None,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     """Train for one epoch and return per-component and aggregate statistics.
 
-    Returned dict always contains ``total`` (mean optimization loss) and
-    ``grad_norm`` (mean L2 gradient norm across steps). When the criterion
-    exposes ``forward_components``, the dict also contains per-term losses
-    keyed by ``ce``, ``dice``, ``tversky``, ``cldice`` so that W&B/CSV can
-    track each loss curve individually.
+    Returned dict always contains ``total`` (mean unscaled optimization loss),
+    ``grad_norm`` (mean L2 gradient norm across optimizer steps), and
+    ``optimizer_steps``. When the criterion exposes ``forward_components``,
+    the dict also contains per-term losses keyed by ``ce``, ``dice``,
+    ``tversky``, ``cldice`` so that W&B/CSV can track each loss curve
+    individually.
     """
+    if grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be > 0, got {grad_accum_steps}")
     ds_base_weights = torch.tensor(
         [1.0, 0.5, 0.25, 0.125], dtype=torch.float32, device=device
     )
@@ -921,41 +1145,76 @@ def train_one_epoch(
     running_grad_norm = 0.0
     component_sums: dict[str, float] = {}
     n_steps = 0
+    n_optimizer_steps = 0
+    num_classes = int(getattr(criterion, "num_classes", 0) or 0)
+    patch_hit_counts = [0] * num_classes
+    sampled_patch_count = 0
     use_amp = scaler is not None and amp_dtype is not None and device.type == "cuda"
-    for batch in loader:
+    total_batches = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+    for batch_idx, batch in enumerate(loader, start=1):
         batch_skel = None
         if len(batch) == 4:
             batch_x, batch_y, batch_skel, _ = batch
         else:
             batch_x, batch_y, _ = batch
         batch_x, batch_y, batch_skel = _flatten_loader_batch(batch_x, batch_y, batch_skel)
+        if num_classes > 0:
+            batch_hits, batch_patch_count = _count_patch_class_hits(
+                batch_y,
+                num_classes,
+            )
+            sampled_patch_count += batch_patch_count
+            for class_id, hit_count in enumerate(batch_hits):
+                patch_hit_counts[class_id] += hit_count
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
         if batch_skel is not None:
             batch_skel = batch_skel.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
+        should_step = _should_step_optimizer(
+            batch_idx,
+            total_batches,
+            grad_accum_steps,
+        )
+        accum_divisor = _grad_accum_divisor(
+            batch_idx,
+            total_batches,
+            grad_accum_steps,
+        )
         if use_amp:
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                 logits = model(batch_x)
                 loss = _multiscale_loss(logits, batch_y, batch_skel)
-            scaler.scale(loss).backward()
-            # Unscale before computing the real-scale gradient norm so the
-            # value we log matches the step actually applied.
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float("inf")
-            )
-            scaler.step(optimizer)
-            scaler.update()
+                backward_loss = loss / accum_divisor
+            scaler.scale(backward_loss).backward()
+            if should_step:
+                # Unscale before computing the real-scale gradient norm so the
+                # value we log matches the step actually applied.
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=float("inf")
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if torch.isfinite(grad_norm):
+                    running_grad_norm += float(grad_norm.item())
+                n_optimizer_steps += 1
         else:
             logits = model(batch_x)
             loss = _multiscale_loss(logits, batch_y, batch_skel)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float("inf")
-            )
-            optimizer.step()
+            backward_loss = loss / accum_divisor
+            backward_loss.backward()
+            if should_step:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=float("inf")
+                )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if torch.isfinite(grad_norm):
+                    running_grad_norm += float(grad_norm.item())
+                n_optimizer_steps += 1
 
         if supports_components:
             with torch.no_grad():
@@ -968,17 +1227,21 @@ def train_one_epoch(
                 )
 
         running_loss += float(loss.item())
-        if torch.isfinite(grad_norm):
-            running_grad_norm += float(grad_norm.item())
         n_steps += 1
 
     divisor = max(n_steps, 1)
+    optimizer_divisor = max(n_optimizer_steps, 1)
     stats: dict[str, float] = {
         "total": running_loss / divisor,
-        "grad_norm": running_grad_norm / divisor,
+        "grad_norm": running_grad_norm / optimizer_divisor,
+        "sampled_patches": float(sampled_patch_count),
+        "optimizer_steps": float(n_optimizer_steps),
+        "grad_accum_steps": float(grad_accum_steps),
     }
     for name, total in component_sums.items():
         stats[name] = total / divisor
+    for class_id, hit_count in enumerate(patch_hit_counts):
+        stats[f"patch_hit_c{class_id:02d}"] = float(hit_count)
     return stats
 
 
@@ -1043,6 +1306,12 @@ def main() -> int:
         raise ValueError("--resume and --load-weights are mutually exclusive.")
     if args.load_weights is not None and not args.load_weights.is_file():
         raise FileNotFoundError(f"--load-weights file not found: {args.load_weights}")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("--grad-accum-steps must be > 0.")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be >= 0.")
+    if args.early_stop_min_delta < 0.0:
+        raise ValueError("--early-stop-min-delta must be >= 0.")
 
     cldice_class_ids = _parse_class_id_list(args.cldice_class_ids)
     rare_class_mode = _parse_rare_class_mode(args.rare_class_mode)
@@ -1089,6 +1358,8 @@ def main() -> int:
         # Highlight which scalars should drive the "best" summary panel.
         wandb_run.define_metric("val/mean_fg_dice", summary="max")
         wandb_run.define_metric("val_mean_fg_dice", summary="max")
+        wandb_run.define_metric("val/thin_vessel_mean_dice", summary="max")
+        wandb_run.define_metric("val_thin_vessel_mean_dice", summary="max")
         wandb_run.define_metric("val/loss_total", summary="min")
         wandb_run.define_metric("train/loss_total", summary="min")
         print(
@@ -1150,6 +1421,11 @@ def main() -> int:
     print(
         f"num_classes={num_classes} patch_size={patch_size} "
         f"val_stride={val_stride} train_batches={len(train_loader)} val_cases={len(val_case_ids)}"
+    )
+    print(
+        "gradient accumulation: "
+        f"steps={args.grad_accum_steps} "
+        f"effective_volume_batch={args.batch_size * args.grad_accum_steps}"
     )
     print(
         "rare-class sampling: "
@@ -1290,6 +1566,15 @@ def main() -> int:
         print("warning: --amp ignored because device is not CUDA.")
     if amp_enabled:
         print(f"AMP enabled: dtype={args.amp_dtype} grad_scaler={scaler.is_enabled() if scaler else False}")
+    if args.early_stop_patience > 0:
+        print(
+            "early stopping enabled: "
+            f"monitor={args.early_stop_monitor} "
+            f"patience={args.early_stop_patience} "
+            f"min_delta={args.early_stop_min_delta:.6f}"
+        )
+    else:
+        print("early stopping disabled")
 
     topbrain_requested = not args.topbrain_disable
     topbrain_runtime = TopBrainRuntime(track=args.topbrain_track) if topbrain_requested else None
@@ -1334,9 +1619,24 @@ def main() -> int:
         safe = name.replace(" ", "_").replace('"', "").strip("_") or f"class_{idx}"
         return safe
 
-    # Only (re)write the CSV header if the file does not already contain rows.
-    # When resuming, we append so prior epoch history is preserved.
-    metrics_has_rows = metrics_csv.is_file() and metrics_csv.stat().st_size > 0
+    class_frequency_csv = _write_split_class_frequency_report(
+        out_dir=out_dir,
+        label_dir=label_dir,
+        train_case_ids=train_case_ids,
+        val_case_ids=val_case_ids,
+        num_classes=num_classes,
+        class_label_fn=_class_label,
+    )
+    print(f"Saved class frequency report: {class_frequency_csv}")
+
+    # Only (re)write the CSV header if the file does not already contain data
+    # rows. When resuming, we append so prior epoch history is preserved. A
+    # header-only CSV is treated as empty so schema updates do not create
+    # mismatched rows.
+    metrics_has_rows = False
+    if metrics_csv.is_file() and metrics_csv.stat().st_size > 0:
+        with metrics_csv.open("r", newline="") as f:
+            metrics_has_rows = sum(1 for _, _line in zip(range(2), f)) > 1
     if not metrics_has_rows:
         with metrics_csv.open("w", newline="") as f:
             writer = csv.writer(f)
@@ -1347,10 +1647,39 @@ def main() -> int:
                     "train_loss",
                     "val_loss",
                     "train_grad_norm",
+                    "train_optimizer_steps",
+                    "grad_accum_steps",
+                    "early_stop_monitor_value",
+                    "early_stop_best",
+                    "early_stop_bad_epochs",
+                    "early_stop_triggered",
+                    "train_sampled_patches",
+                    *[
+                        f"train_patch_hit_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
                     *[f"train_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     *[f"val_loss_{name}" for name in DiceCELoss.COMPONENT_NAMES],
                     "val_mean_fg_dice",
                     "val_mean_fg_dice_all_cases_present",
+                    "val_thin_vessel_mean_dice",
+                    "val_thin_vessel_mean_dice_supported",
+                    *[
+                        f"val_gt_support_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
+                    *[
+                        f"val_pred_support_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
+                    *[
+                        f"val_gt_voxels_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
+                    *[
+                        f"val_pred_voxels_c{c:02d}_{_class_label(c)}"
+                        for c in range(num_classes)
+                    ],
                     *[
                         f"val_dice_c{c:02d}_{_class_label(c)}"
                         for c in range(num_classes)
@@ -1361,7 +1690,11 @@ def main() -> int:
             )
 
     best_val_dice = -1.0
+    early_stop_best = float("-inf")
+    early_stop_bad_epochs = 0
+    early_stop_triggered = False
     start_epoch = 1
+    last_completed_epoch = start_epoch - 1
     final_weights_path = out_dir / "model_final_weights.pt"
     best_weights_path = out_dir / "model_best_weights.pt"
 
@@ -1374,6 +1707,8 @@ def main() -> int:
         "train_loss": [],
         "val_loss": [],
         "val_mean_fg_dice": [],
+        "val_thin_vessel_mean_dice": [],
+        "val_thin_vessel_mean_dice_supported": [],
     }
     for name in DiceCELoss.COMPONENT_NAMES:
         history[f"train_loss_{name}"] = []
@@ -1391,6 +1726,8 @@ def main() -> int:
             device=device,
         )
         start_epoch = last_completed_epoch + 1
+        if args.early_stop_monitor == "val_mean_fg_dice":
+            early_stop_best = best_val_dice
         print(
             f"resumed from {args.resume}: "
             f"last_completed_epoch={last_completed_epoch} "
@@ -1447,9 +1784,16 @@ def main() -> int:
             device=device,
             scaler=scaler,
             amp_dtype=amp_dtype if amp_enabled else None,
+            grad_accum_steps=args.grad_accum_steps,
         )
         train_loss = train_stats["total"]
         train_grad_norm = train_stats.get("grad_norm", float("nan"))
+        train_optimizer_steps = int(train_stats.get("optimizer_steps", 0.0))
+        train_sampled_patches = int(train_stats.get("sampled_patches", 0.0))
+        train_patch_hits = [
+            int(train_stats.get(f"patch_hit_c{class_id:02d}", 0.0))
+            for class_id in range(num_classes)
+        ]
         train_components = {
             name: train_stats[name]
             for name in DiceCELoss.COMPONENT_NAMES
@@ -1461,6 +1805,7 @@ def main() -> int:
             val_mean_fg_dice_all_cases_present,
             per_class_dice,
             val_components,
+            val_support,
         ) = validate_one_epoch(
             model=model,
             val_case_ids=val_case_ids,
@@ -1482,6 +1827,19 @@ def main() -> int:
         full_metrics = (
             topbrain_full_acc.finalize() if topbrain_full_acc is not None else empty_topbrain_metrics()
         )
+        val_gt_support = val_support["gt_case_counts"]
+        val_pred_support = val_support["pred_case_counts"]
+        val_gt_voxels = val_support["gt_voxel_counts"]
+        val_pred_voxels = val_support["pred_voxel_counts"]
+        val_thin_vessel_mean_dice = _mean_dice_for_classes(
+            per_class_dice,
+            THIN_VESSEL_CLASS_IDS,
+        )
+        val_thin_vessel_mean_dice_supported = _mean_dice_for_classes(
+            per_class_dice,
+            THIN_VESSEL_CLASS_IDS,
+            support_counts=val_gt_support,
+        )
 
         lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step()
@@ -1492,6 +1850,24 @@ def main() -> int:
                 return ""
             return f"{value:.6f}"
 
+        early_stop_metric_value = (
+            val_thin_vessel_mean_dice
+            if args.early_stop_monitor == "val_thin_vessel_mean_dice"
+            else val_mean_fg_dice
+        )
+        early_stop_improved = _is_metric_improved(
+            early_stop_metric_value,
+            early_stop_best,
+            min_delta=args.early_stop_min_delta,
+        )
+        if args.early_stop_patience > 0:
+            if early_stop_improved:
+                early_stop_best = early_stop_metric_value
+                early_stop_bad_epochs = 0
+            else:
+                early_stop_bad_epochs += 1
+            early_stop_triggered = early_stop_bad_epochs >= args.early_stop_patience
+
         with metrics_csv.open("a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -1501,6 +1877,22 @@ def main() -> int:
                     f"{train_loss:.6f}",
                     f"{val_loss:.6f}",
                     "" if not np.isfinite(train_grad_norm) else f"{train_grad_norm:.6f}",
+                    train_optimizer_steps,
+                    args.grad_accum_steps,
+                    (
+                        ""
+                        if not np.isfinite(early_stop_metric_value)
+                        else f"{early_stop_metric_value:.6f}"
+                    ),
+                    (
+                        ""
+                        if not np.isfinite(early_stop_best)
+                        else f"{early_stop_best:.6f}"
+                    ),
+                    early_stop_bad_epochs,
+                    int(early_stop_triggered),
+                    train_sampled_patches,
+                    *[str(hit_count) for hit_count in train_patch_hits],
                     *[
                         _fmt_component(train_components, name)
                         for name in DiceCELoss.COMPONENT_NAMES
@@ -1515,6 +1907,20 @@ def main() -> int:
                         if not np.isfinite(val_mean_fg_dice_all_cases_present)
                         else f"{val_mean_fg_dice_all_cases_present:.6f}"
                     ),
+                    (
+                        ""
+                        if not np.isfinite(val_thin_vessel_mean_dice)
+                        else f"{val_thin_vessel_mean_dice:.6f}"
+                    ),
+                    (
+                        ""
+                        if not np.isfinite(val_thin_vessel_mean_dice_supported)
+                        else f"{val_thin_vessel_mean_dice_supported:.6f}"
+                    ),
+                    *[str(count) for count in val_gt_support],
+                    *[str(count) for count in val_pred_support],
+                    *[str(count) for count in val_gt_voxels],
+                    *[str(count) for count in val_pred_voxels],
                     *[f"{d:.6f}" for d in per_class_dice],
                     *_topbrain_csv_values(
                         run_topbrain_this_epoch and bool(topbrain_subset_ids_set),
@@ -1550,9 +1956,12 @@ def main() -> int:
         print(
             f"[epoch {epoch:03d}/{args.epochs:03d}] "
             f"lr={lr:.2e} grad_norm={train_grad_norm:.3f} "
+            f"optim_steps={train_optimizer_steps} "
             f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} val_mean_fg_dice={val_mean_fg_dice:.6f}"
             f"{best_tag} "
+            f"val_thin_vessel_mean_dice={val_thin_vessel_mean_dice:.6f} "
+            f"early_stop_bad_epochs={early_stop_bad_epochs} "
             "val_mean_fg_dice_all_cases_present="
             f"{val_mean_fg_dice_all_cases_present:.6f} "
             f"time={elapsed:.1f}s"
@@ -1569,6 +1978,58 @@ def main() -> int:
                 if name in val_components
             )
             print(f"loss_components: train[{train_bits}] val[{val_bits}]")
+        if train_sampled_patches > 0:
+            zero_hit_classes = [
+                f"c{idx:02d}_{_class_label(idx)}"
+                for idx, hit_count in enumerate(train_patch_hits)
+                if idx > 0 and hit_count == 0
+            ]
+            lowest_hit_classes = sorted(
+                (
+                    (hit_count, f"c{idx:02d}_{_class_label(idx)}")
+                    for idx, hit_count in enumerate(train_patch_hits)
+                    if idx > 0
+                ),
+                key=lambda item: item[0],
+            )[:8]
+            print(
+                "sampling_diagnostics: "
+                f"sampled_patches={train_sampled_patches} "
+                f"zero_hit_fg={len(zero_hit_classes)} "
+                "lowest_hits="
+                + ", ".join(
+                    f"{label}:{hit_count}" for hit_count, label in lowest_hit_classes
+                )
+            )
+        if len(val_case_ids) > 0:
+            val_absent_gt = [
+                f"c{idx:02d}_{_class_label(idx)}"
+                for idx, count in enumerate(val_gt_support)
+                if idx > 0 and count == 0
+            ]
+            val_never_predicted = [
+                f"c{idx:02d}_{_class_label(idx)}"
+                for idx, count in enumerate(val_pred_support)
+                if idx > 0 and count == 0
+            ]
+            low_gt_support = sorted(
+                (
+                    (count, f"c{idx:02d}_{_class_label(idx)}")
+                    for idx, count in enumerate(val_gt_support)
+                    if idx > 0
+                ),
+                key=lambda item: item[0],
+            )[:8]
+            print(
+                "validation_support: "
+                f"val_cases={len(val_case_ids)} "
+                f"absent_gt_fg={len(val_absent_gt)} "
+                f"never_predicted_fg={len(val_never_predicted)} "
+                "lowest_gt_support="
+                + ", ".join(
+                    f"{label}:{count}" for count, label in low_gt_support
+                )
+            )
         print(
             "per_class_dice: "
             + ", ".join(
@@ -1605,18 +2066,54 @@ def main() -> int:
                 "time/epoch_sec": float(elapsed),
                 "optim/lr": float(lr),
                 "optim/grad_norm": float(train_grad_norm),
+                "optim/steps_per_epoch": int(train_optimizer_steps),
+                "optim/grad_accum_steps": int(args.grad_accum_steps),
                 # Top-level mirrors so the summary panel picks them up by default.
                 "train_loss": float(train_loss),
                 "val_loss": float(val_loss),
                 "val_mean_fg_dice": float(val_mean_fg_dice),
+                "val_thin_vessel_mean_dice": float(val_thin_vessel_mean_dice),
                 # Namespaced metrics give clean per-section dashboards:
                 #   train/loss_*  vs  val/loss_*    (train-vs-val overlay)
                 #   val/dice/class/<name>           (per-class dice)
                 "train/loss_total": float(train_loss),
                 "val/loss_total": float(val_loss),
                 "val/mean_fg_dice": float(val_mean_fg_dice),
+                "val/thin_vessel_mean_dice": float(val_thin_vessel_mean_dice),
                 "val/best_mean_fg_dice": float(best_val_dice),
+                "train/sampled_patches": int(train_sampled_patches),
+                "train/early_stop_bad_epochs": int(early_stop_bad_epochs),
+                "train/early_stop_metric": float(early_stop_metric_value),
             }
+            if np.isfinite(early_stop_best):
+                log_payload["train/early_stop_best"] = float(early_stop_best)
+            if np.isfinite(val_thin_vessel_mean_dice_supported):
+                log_payload["val_thin_vessel_mean_dice_supported"] = float(
+                    val_thin_vessel_mean_dice_supported
+                )
+                log_payload["val/thin_vessel_mean_dice_supported"] = float(
+                    val_thin_vessel_mean_dice_supported
+                )
+            patch_hit_rows: list[list[Any]] = []
+            for idx, hit_count in enumerate(train_patch_hits):
+                safe_name = _class_label(idx)
+                log_payload[f"train_patch_hit_c{idx:02d}"] = int(hit_count)
+                log_payload[f"train/sampling/patch_hit_count/{safe_name}"] = int(
+                    hit_count
+                )
+                if train_sampled_patches > 0:
+                    hit_rate = float(hit_count) / float(train_sampled_patches)
+                    log_payload[f"train/sampling/patch_hit_rate/{safe_name}"] = hit_rate
+                patch_hit_rows.append([f"{idx:02d}_{safe_name}", int(hit_count)])
+            patch_hit_table = wandb.Table(
+                data=patch_hit_rows, columns=["class", "patch_hits"]
+            )
+            log_payload["train/sampling/patch_hit_bar"] = wandb.plot.bar(
+                patch_hit_table,
+                label="class",
+                value="patch_hits",
+                title=f"Train patch class hits (epoch {epoch})",
+            )
             for name, value in train_components.items():
                 if np.isfinite(value):
                     log_payload[f"train/loss_{name}"] = float(value)
@@ -1630,6 +2127,39 @@ def main() -> int:
                 log_payload["val/mean_fg_dice_all_cases_present"] = float(
                     val_mean_fg_dice_all_cases_present
                 )
+            support_rows: list[list[Any]] = []
+            for idx in range(num_classes):
+                safe_name = _class_label(idx)
+                gt_cases = int(val_gt_support[idx])
+                pred_cases = int(val_pred_support[idx])
+                gt_voxels = int(val_gt_voxels[idx])
+                pred_voxels = int(val_pred_voxels[idx])
+                log_payload[f"val_gt_support_c{idx:02d}"] = gt_cases
+                log_payload[f"val_pred_support_c{idx:02d}"] = pred_cases
+                log_payload[f"val/support/gt_cases/{safe_name}"] = gt_cases
+                log_payload[f"val/support/pred_cases/{safe_name}"] = pred_cases
+                log_payload[f"val/support/gt_voxels/{safe_name}"] = gt_voxels
+                log_payload[f"val/support/pred_voxels/{safe_name}"] = pred_voxels
+                support_rows.append(
+                    [
+                        f"{idx:02d}_{safe_name}",
+                        gt_cases,
+                        pred_cases,
+                        gt_voxels,
+                        pred_voxels,
+                    ]
+                )
+            support_table = wandb.Table(
+                data=support_rows,
+                columns=[
+                    "class",
+                    "gt_cases",
+                    "pred_cases",
+                    "gt_voxels",
+                    "pred_voxels",
+                ],
+            )
+            log_payload["val/support/table"] = support_table
 
             # Per-class Dice: log as both flat scalars (auto line charts) and a
             # bar chart table keyed by class name so W&B renders a labelled
@@ -1696,6 +2226,10 @@ def main() -> int:
         history["train_loss"].append(float(train_loss))
         history["val_loss"].append(float(val_loss))
         history["val_mean_fg_dice"].append(float(val_mean_fg_dice))
+        history["val_thin_vessel_mean_dice"].append(float(val_thin_vessel_mean_dice))
+        history["val_thin_vessel_mean_dice_supported"].append(
+            float(val_thin_vessel_mean_dice_supported)
+        )
         for name in DiceCELoss.COMPONENT_NAMES:
             history[f"train_loss_{name}"].append(
                 float(train_components.get(name, float("nan")))
@@ -1707,10 +2241,30 @@ def main() -> int:
             value = per_class_dice[c] if c < len(per_class_dice) else float("nan")
             history[f"val_dice_c{c:02d}"].append(float(value))
 
+        last_completed_epoch = epoch
+        if early_stop_triggered:
+            print(
+                "early stopping triggered: "
+                f"monitor={args.early_stop_monitor} "
+                f"best={early_stop_best:.6f} "
+                f"last={early_stop_metric_value:.6f} "
+                f"bad_epochs={early_stop_bad_epochs} "
+                f"patience={args.early_stop_patience}"
+            )
+            if wandb_run is not None:
+                wandb_run.summary["early_stopped"] = True
+                wandb_run.summary["early_stop_epoch"] = int(epoch)
+                wandb_run.summary["early_stop_monitor"] = args.early_stop_monitor
+            break
+
     final_epoch_ran_topbrain_full = (
         topbrain_enabled
         and args.topbrain_per_epoch
-        and should_run_topbrain_full_eval(args.epochs, args.topbrain_eval_every_n_epochs)
+        and last_completed_epoch >= start_epoch
+        and should_run_topbrain_full_eval(
+            last_completed_epoch,
+            args.topbrain_eval_every_n_epochs,
+        )
     )
     need_final_topbrain = topbrain_enabled and topbrain_runtime and (
         not args.topbrain_per_epoch or not final_epoch_ran_topbrain_full
@@ -1744,6 +2298,7 @@ def main() -> int:
             _final_val_mean_fg_dice_all_cases_present,
             _final_per_class_dice,
             _final_val_components,
+            _final_val_support,
         ) = validate_one_epoch(
             model=model,
             val_case_ids=final_case_ids,
@@ -1771,6 +2326,7 @@ def main() -> int:
     torch.save(model.state_dict(), final_weights_path)
     if wandb_run is not None:
         wandb_run.summary["best_val_mean_fg_dice"] = float(best_val_dice)
+        wandb_run.summary["early_stopped"] = bool(early_stop_triggered)
         _log_wandb_summary_charts(
             wandb_run=wandb_run,
             history=history,
@@ -1784,6 +2340,12 @@ def main() -> int:
         wandb_run.log_artifact(artifact)
         wandb_run.finish()
     print(f"\nTraining complete. Best val_mean_fg_dice={best_val_dice:.6f}")
+    if early_stop_triggered:
+        print(
+            "Stopped early at epoch "
+            f"{last_completed_epoch} "
+            f"(monitor={args.early_stop_monitor}, patience={args.early_stop_patience})."
+        )
     print(f"Saved metrics: {metrics_csv}")
     print(f"Saved final weights: {final_weights_path}")
     if best_weights_path.is_file():

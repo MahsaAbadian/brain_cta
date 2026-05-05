@@ -29,6 +29,15 @@ This file tracks what is already done, what is currently underway, and what stil
 - Added per-class Dice logging to console and `metrics.csv`.
 - Added present-only foreground Dice tracking in validation (plus `val_mean_fg_dice_all` diagnostic metric).
 - Added challenge-like local evaluation script `src/evaluate_challenge_like.py` for full-volume inference.
+- Added per-class training patch hit diagnostics to confirm rare/thin classes are sampled each epoch.
+- Added Part A metric diagnostics:
+  - per-class validation GT/prediction support counts per epoch
+  - train/val class-frequency report (`class_frequency.csv`)
+  - near-zero support flags for split-level class support
+- Added thin-vessel mean Dice summary metrics for the known failing group.
+- Added early stopping for faster experiment cycles when validation metrics plateau.
+- Added gradient accumulation support for larger effective batches under GPU memory limits.
+- Added stratified K-fold split generation based on foreground class presence.
 
 ## In Progress
 
@@ -77,17 +86,17 @@ context to distinguish similar-looking vessel branches.
 
 ### A) Metric and diagnosis tasks
 
-- Add per-class "support" report per epoch:
-  - number of validation batches where GT class is present
-  - number of predicted-positive batches
+- Done: add per-class support report per epoch:
+  - number of validation cases where GT class is present
+  - number of validation cases where prediction is positive
   - helps separate true failure from class-absent artifacts.
-- Add class-frequency table for train and val splits side-by-side.
-- Flag classes with near-zero support to avoid over-interpreting noisy Dice.
+- Done: add class-frequency table for train and val splits side-by-side.
+- Done: flag classes with near-zero support to avoid over-interpreting noisy Dice.
 
 ### B) Data split and validation robustness
 
 - Try 3-fold or 5-fold cross-validation to reduce split bias on rare classes.
-- Build stratified split(s) based on class presence so rare labels appear in train and val.
+- Done: build stratified split(s) based on class presence so rare labels appear in train and val.
 - For final reporting, aggregate fold-level per-class Dice and variance.
 
 ### C) Sampling strategy for rare classes
@@ -119,9 +128,9 @@ context to distinguish similar-looking vessel branches.
   parameters overfit the small dataset and rare classes especially suffer).
 - Try residual blocks inside `ConvBlock3D` (see Thin Vessel Plan section G) — more capacity
   per parameter without the overfitting cost of wider channels.
-- Test gradient accumulation to emulate larger batch behavior if GPU memory is tight.
+- Done: add gradient accumulation to emulate larger batch behavior if GPU memory is tight.
 - Tune LR schedule/warmup for stability on rare classes.
-- Add early-stop-on-plateau logic for faster iteration cycles.
+- Done: add early-stop-on-plateau logic for faster iteration cycles.
 
 ### F) Inference and post-processing
 
@@ -205,7 +214,7 @@ below are ordered roughly from easiest to hardest to implement.
   are averaged over more patients and left-right asymmetry noise is reduced.
 - Report per-class Dice with the number of val patients where GT was present alongside it,
   so fake 1.0 scores are immediately visible.
-- Add a "thin vessel mean Dice" summary metric = mean Dice over {c02, c03, c04, c06, c10,
+- Done: add a "thin vessel mean Dice" summary metric = mean Dice over {c02, c03, c04, c06, c10,
   c11, c12, c23, c25} only — the group that is currently failing — to track improvement
   specifically for these structures.
 
