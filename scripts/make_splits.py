@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Sequence
 
+import nibabel as nib
 import numpy as np
 from sklearn.model_selection import GroupKFold, KFold
 
@@ -74,6 +76,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stratify-by-class-presence",
+        action="store_true",
+        help=(
+            "Build folds with a deterministic greedy multilabel stratifier "
+            "based on foreground class presence in each label volume. This "
+            "helps rare labels appear across validation folds when possible. "
+            "Cannot be combined with --group-regex."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite the output file if it already exists.",
@@ -115,6 +127,96 @@ def _groups_for_ids(case_ids: Sequence[str], pattern: str) -> list[str]:
             )
         groups.append(match.group(1) if match.groups() else match.group(0))
     return groups
+
+
+def _load_case_class_presence(
+    label_dir: Path,
+    case_ids: Sequence[str],
+) -> dict[str, set[int]]:
+    """Load foreground class-presence sets for each case."""
+    presence: dict[str, set[int]] = {}
+    for case_id in case_ids:
+        label_path = label_dir / f"{case_id}.nii.gz"
+        if not label_path.is_file():
+            raise FileNotFoundError(f"Missing label for case {case_id}: {label_path}")
+        label = np.asanyarray(nib.load(str(label_path)).dataobj)
+        classes = {int(c) for c in np.unique(label).tolist() if int(c) > 0}
+        presence[case_id] = classes
+    return presence
+
+
+def _build_stratified_folds_from_presence(
+    case_ids: list[str],
+    class_presence: dict[str, set[int]],
+    *,
+    n_folds: int,
+    seed: int,
+) -> list[dict[str, list[str]]]:
+    """Greedy multilabel stratification over per-case foreground labels."""
+    if n_folds < 2:
+        raise ValueError(f"--n-folds must be >= 2, got {n_folds}")
+    if n_folds > len(case_ids):
+        raise ValueError(
+            f"--n-folds={n_folds} exceeds number of cases ({len(case_ids)})."
+        )
+
+    rng = random.Random(seed)
+    shuffled_ids = case_ids[:]
+    rng.shuffle(shuffled_ids)
+
+    all_classes = sorted(set().union(*(class_presence.get(cid, set()) for cid in case_ids)))
+    if not all_classes:
+        return _build_folds(case_ids, n_folds=n_folds, seed=seed, groups=None)
+
+    global_counts = {
+        class_id: sum(class_id in class_presence.get(cid, set()) for cid in case_ids)
+        for class_id in all_classes
+    }
+    target_fold_size = len(case_ids) / n_folds
+    target_class_counts = {
+        class_id: global_counts[class_id] / n_folds for class_id in all_classes
+    }
+    random_rank = {case_id: idx for idx, case_id in enumerate(shuffled_ids)}
+
+    def _case_sort_key(case_id: str) -> tuple[int, int, int, str]:
+        classes = class_presence.get(case_id, set())
+        rarest = min((global_counts[c] for c in classes), default=len(case_ids) + 1)
+        return (rarest, -len(classes), random_rank[case_id], case_id)
+
+    ordered_ids = sorted(case_ids, key=_case_sort_key)
+    fold_cases: list[list[str]] = [[] for _ in range(n_folds)]
+    fold_class_counts = [
+        {class_id: 0 for class_id in all_classes} for _ in range(n_folds)
+    ]
+
+    for case_id in ordered_ids:
+        classes = class_presence.get(case_id, set())
+        best_fold = 0
+        best_score: tuple[float, int, int] | None = None
+        for fold_idx in range(n_folds):
+            next_size = len(fold_cases[fold_idx]) + 1
+            size_score = ((next_size - target_fold_size) / max(target_fold_size, 1.0)) ** 2
+            class_score = 0.0
+            for class_id in classes:
+                next_count = fold_class_counts[fold_idx][class_id] + 1
+                target = max(target_class_counts[class_id], 1e-6)
+                class_score += ((next_count - target) / target) ** 2
+            score = (class_score + 0.05 * size_score, next_size, fold_idx)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_fold = fold_idx
+
+        fold_cases[best_fold].append(case_id)
+        for class_id in classes:
+            fold_class_counts[best_fold][class_id] += 1
+
+    folds: list[dict[str, list[str]]] = []
+    all_id_set = set(case_ids)
+    for fold_idx in range(n_folds):
+        val_ids = sorted(fold_cases[fold_idx])
+        train_ids = sorted(all_id_set - set(val_ids))
+        folds.append({"train": train_ids, "val": val_ids})
+    return folds
 
 
 def _build_folds(
@@ -181,12 +283,24 @@ def main() -> int:
     groups = (
         _groups_for_ids(pool, args.group_regex) if args.group_regex else None
     )
-    folds = _build_folds(
-        pool,
-        n_folds=args.n_folds,
-        seed=args.seed,
-        groups=groups,
-    )
+    if args.stratify_by_class_presence and groups is not None:
+        raise ValueError("--stratify-by-class-presence cannot be combined with --group-regex.")
+    class_presence: dict[str, set[int]] | None = None
+    if args.stratify_by_class_presence:
+        class_presence = _load_case_class_presence(args.label_dir, pool)
+        folds = _build_stratified_folds_from_presence(
+            pool,
+            class_presence,
+            n_folds=args.n_folds,
+            seed=args.seed,
+        )
+    else:
+        folds = _build_folds(
+            pool,
+            n_folds=args.n_folds,
+            seed=args.seed,
+            groups=groups,
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(folds, indent=2) + "\n")
@@ -194,11 +308,30 @@ def main() -> int:
     print(f"Wrote {args.output} with {len(folds)} folds over {len(pool)} cases.")
     if holdout_ids:
         print(f"Held-out cases excluded from all folds: {sorted(holdout_ids)}")
+    if class_presence is not None:
+        global_classes = sorted(set().union(*class_presence.values()))
+        rare_classes = [
+            class_id
+            for class_id in global_classes
+            if sum(class_id in class_presence[cid] for cid in pool) < args.n_folds
+        ]
+        if rare_classes:
+            print(
+                "Warning: these classes appear in fewer cases than folds and "
+                f"cannot be present in every validation fold: {rare_classes}"
+            )
     for i, fold in enumerate(folds):
         print(
             f"  fold {i}: train={len(fold['train'])} val={len(fold['val'])}"
             f"  val={fold['val']}"
         )
+        if class_presence is not None:
+            val_classes = sorted(
+                set().union(*(class_presence[cid] for cid in fold["val"]))
+                if fold["val"]
+                else set()
+            )
+            print(f"    val foreground classes={val_classes}")
     return 0
 
 

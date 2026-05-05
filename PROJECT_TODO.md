@@ -37,6 +37,7 @@ This file tracks what is already done, what is currently underway, and what stil
 - Added thin-vessel mean Dice summary metrics for the known failing group.
 - Added early stopping for faster experiment cycles when validation metrics plateau.
 - Added gradient accumulation support for larger effective batches under GPU memory limits.
+- Added stratified K-fold split generation based on foreground class presence.
 
 ## In Progress
 
@@ -95,7 +96,7 @@ context to distinguish similar-looking vessel branches.
 ### B) Data split and validation robustness
 
 - Try 3-fold or 5-fold cross-validation to reduce split bias on rare classes.
-- Build stratified split(s) based on class presence so rare labels appear in train and val.
+- Done: build stratified split(s) based on class presence so rare labels appear in train and val.
 - For final reporting, aggregate fold-level per-class Dice and variance.
 
 ### C) Sampling strategy for rare classes
