@@ -54,8 +54,16 @@ def load_fold_from_splits_json(
 
 
 def random_flip_3d(img: np.ndarray, lbl: np.ndarray, p: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
-    """Random axis flips, same transform on image and label."""
-    for axis in (0, 1, 2):
+    """Random axis flips, same transform on image and label.
+
+    Axis 0 (left/right) is intentionally excluded: TopBrain volumes are stored
+    in LPS orientation, so axis 0 separates anatomically right- vs left-sided
+    structures (R-ICA / L-ICA, R-M1 / L-M1, ...). Flipping that axis without
+    also swapping the paired R/L class labels would teach the model
+    contradictory side assignments and destroy R/L discrimination, so we only
+    flip the A/P (axis 1) and I/S (axis 2) axes here.
+    """
+    for axis in (1, 2):
         if random.random() < p:
             img = np.flip(img, axis=axis).copy()
             lbl = np.flip(lbl, axis=axis).copy()
@@ -368,7 +376,13 @@ class CTAPatchDataset(Dataset):
                 px, py, pz = self.patch_size
                 skel_patch = skel_volume[:, sx : sx + px, sy : sy + py, sz : sz + pz]
             if self.do_augment:
-                for axis in (0, 1, 2):
+                # Skip axis 0 (left/right) on purpose: volumes are LPS, so a
+                # raw L/R flip without swapping paired class labels (R-ICA <->
+                # L-ICA, R-M1 <-> L-M1, etc.) trains the head to predict the
+                # right-sided class on the left side and vice versa. We only
+                # flip A/P (axis 1) and I/S (axis 2). Skeleton patches are
+                # (C, D, H, W), so the spatial axes are offset by one.
+                for axis in (1, 2):
                     if random.random() < 0.5:
                         img = np.flip(img, axis=axis).copy()
                         lbl = np.flip(lbl, axis=axis).copy()
