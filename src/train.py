@@ -218,6 +218,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--aug-rotation-prob",
+        type=float,
+        default=0.5,
+        help="Probability of random 3D rotation augmentation.",
+    )
+    parser.add_argument(
+        "--aug-elastic-prob",
+        type=float,
+        default=0.3,
+        help="Probability of random 3D elastic deformation augmentation.",
+    )
+    parser.add_argument(
+        "--aug-jitter-prob",
+        type=float,
+        default=0.5,
+        help="Probability of random intensity jitter augmentation.",
+    )
+    parser.add_argument(
+        "--aug-gamma-prob",
+        type=float,
+        default=0.5,
+        help="Probability of random gamma augmentation.",
+    )
+    parser.add_argument(
         "--dice-weight",
         type=float,
         default=1.0,
@@ -1022,6 +1046,10 @@ def _build_overfit_loaders(
     rare_class_weight_max: float,
     rare_class_mode: Literal["presence", "voxel", "hybrid"],
     target_skeleton_dir: Path | None,
+    aug_rotation_prob: float = 0.5,
+    aug_elastic_prob: float = 0.3,
+    aug_jitter_prob: float = 0.5,
+    aug_gamma_prob: float = 0.5,
 ) -> tuple[DataLoader, int]:
     image_dir = Path("training_data_resampled/imagesTr_topbrain_ct")
     label_dir = Path("training_data_resampled/labelsTr_topbrain_ct")
@@ -1055,6 +1083,10 @@ def _build_overfit_loaders(
         rare_class_prob=rare_class_patch_prob,
         rare_class_weights=rare_class_weights,
         target_skeleton_dir=target_skeleton_dir,
+        aug_rotation_prob=aug_rotation_prob,
+        aug_elastic_prob=aug_elastic_prob,
+        aug_jitter_prob=aug_jitter_prob,
+        aug_gamma_prob=aug_gamma_prob,
     )
     train_loader = DataLoader(
         train_ds,
@@ -1148,6 +1180,10 @@ def main() -> int:
             rare_class_weight_max=args.rare_class_weight_max,
             rare_class_mode=rare_class_mode,
             target_skeleton_dir=target_skeleton_dir,
+            aug_rotation_prob=args.aug_rotation_prob,
+            aug_elastic_prob=args.aug_elastic_prob,
+            aug_jitter_prob=args.aug_jitter_prob,
+            aug_gamma_prob=args.aug_gamma_prob,
         )
         train_case_ids = [args.overfit_case_id]
         val_case_ids = [args.overfit_case_id]
@@ -1168,6 +1204,10 @@ def main() -> int:
             target_skeleton_dir=target_skeleton_dir,
             splits_json=args.splits_json,
             fold=args.fold,
+            aug_rotation_prob=args.aug_rotation_prob,
+            aug_elastic_prob=args.aug_elastic_prob,
+            aug_jitter_prob=args.aug_jitter_prob,
+            aug_gamma_prob=args.aug_gamma_prob,
         )
         train_case_ids = train_ds.case_ids
         if args.splits_json is not None and args.splits_json.is_file():

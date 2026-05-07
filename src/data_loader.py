@@ -18,6 +18,12 @@ from data_utils import (
     split_and_save,
     read_num_classes_from_labelmap,
 )
+from augmentations import (
+    random_intensity_jitter,
+    random_gamma_augmentation,
+    random_rotation_3d,
+    random_elastic_deformation_3d,
+)
 
 
 def load_fold_from_splits_json(
@@ -285,6 +291,10 @@ class CTAPatchDataset(Dataset):
         rare_class_prob: float = 0.0,
         rare_class_weights: np.ndarray | None = None,
         target_skeleton_dir: Path | None = None,
+        aug_rotation_prob: float = 0.5,
+        aug_elastic_prob: float = 0.3,
+        aug_jitter_prob: float = 0.5,
+        aug_gamma_prob: float = 0.5,
     ) -> None:
         self.case_ids = list(case_ids)
         self.image_dir = image_dir
@@ -297,6 +307,10 @@ class CTAPatchDataset(Dataset):
         self.rare_class_prob = float(np.clip(rare_class_prob, 0.0, 1.0))
         self.rare_class_weights = rare_class_weights
         self.target_skeleton_dir = target_skeleton_dir
+        self.aug_rotation_prob = aug_rotation_prob
+        self.aug_elastic_prob = aug_elastic_prob
+        self.aug_jitter_prob = aug_jitter_prob
+        self.aug_gamma_prob = aug_gamma_prob
 
     def __len__(self) -> int:
         return len(self.case_ids)
@@ -388,6 +402,14 @@ class CTAPatchDataset(Dataset):
                         lbl = np.flip(lbl, axis=axis).copy()
                         if skel_patch is not None:
                             skel_patch = np.flip(skel_patch, axis=axis + 1).copy()
+                
+                # Apply 3D spatial augmentations
+                img, lbl, skel_patch = random_rotation_3d(img, lbl, skel_patch, p=self.aug_rotation_prob, max_angle=15.0)
+                img, lbl, skel_patch = random_elastic_deformation_3d(img, lbl, skel_patch, p=self.aug_elastic_prob, alpha=10.0, sigma=3.0)
+                
+                # Apply intensity augmentations
+                img = random_intensity_jitter(img, p=self.aug_jitter_prob, factor=0.1)
+                img = random_gamma_augmentation(img, p=self.aug_gamma_prob, gamma_range=(0.7, 1.5))
             out_img_tensors.append(torch.from_numpy(img).float().unsqueeze(0))
             out_lbl_tensors.append(torch.from_numpy(lbl).long())
             if skel_patch is not None:
@@ -425,6 +447,10 @@ def build_train_val_loaders(
     target_skeleton_dir: Path | None = None,
     splits_json: Path | None = None,
     fold: int = 0,
+    aug_rotation_prob: float = 0.5,
+    aug_elastic_prob: float = 0.3,
+    aug_jitter_prob: float = 0.5,
+    aug_gamma_prob: float = 0.5,
 ) -> tuple[CTAPatchDataset, list[str], DataLoader, int]:
     """
     Build CTA train dataset + loader and return validation case IDs.
@@ -493,6 +519,10 @@ def build_train_val_loaders(
         rare_class_prob=rare_class_patch_prob,
         rare_class_weights=rare_class_weights,
         target_skeleton_dir=target_skeleton_dir,
+        aug_rotation_prob=aug_rotation_prob,
+        aug_elastic_prob=aug_elastic_prob,
+        aug_jitter_prob=aug_jitter_prob,
+        aug_gamma_prob=aug_gamma_prob,
     )
     train_loader = DataLoader(
         train_ds,
