@@ -59,21 +59,6 @@ def load_fold_from_splits_json(
     return train_ids, val_ids
 
 
-def random_flip_3d(img: np.ndarray, lbl: np.ndarray, p: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
-    """Random axis flips, same transform on image and label.
-
-    Axis 0 (left/right) is intentionally excluded: TopBrain volumes are stored
-    in LPS orientation, so axis 0 separates anatomically right- vs left-sided
-    structures (R-ICA / L-ICA, R-M1 / L-M1, ...). Flipping that axis without
-    also swapping the paired R/L class labels would teach the model
-    contradictory side assignments and destroy R/L discrimination, so we only
-    flip the A/P (axis 1) and I/S (axis 2) axes here.
-    """
-    for axis in (1, 2):
-        if random.random() < p:
-            img = np.flip(img, axis=axis).copy()
-            lbl = np.flip(lbl, axis=axis).copy()
-    return img, lbl
 
 
 def sample_patches_option_d(

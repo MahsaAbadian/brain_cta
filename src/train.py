@@ -256,8 +256,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tversky-weight",
         type=float,
-        default=1.0,
-        help="Weight for Tversky/Focal-Tversky term inside DiceCELoss.",
+        default=0.0,
+        help="Weight for Tversky/Focal-Tversky term inside DiceCELoss (0 disables).",
     )
     parser.add_argument(
         "--tversky-alpha",
@@ -280,7 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cldice-weight",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Weight for clDice term inside DiceCELoss (0 disables clDice).",
     )
     parser.add_argument(
@@ -1342,7 +1342,17 @@ def main() -> int:
         f"cldice={args.cldice_weight:.3f} cldice_iters={args.cldice_iters} "
         f"cldice_class_ids={cldice_class_ids} "
         f"cldice_channel_chunk={args.cldice_channel_chunk} "
+        f"skelrecall={args.skelrecall_weight:.3f} "
+        f"cbdice={args.cbdice_weight:.3f} "
+        f"cas={args.cas_weight:.3f} "
         f"precomputed_target_skeletons={target_skeleton_dir}"
+    )
+    print(
+        "augmentation probs: "
+        f"rotation={args.aug_rotation_prob:.2f} "
+        f"elastic={args.aug_elastic_prob:.2f} "
+        f"jitter={args.aug_jitter_prob:.2f} "
+        f"gamma={args.aug_gamma_prob:.2f}"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

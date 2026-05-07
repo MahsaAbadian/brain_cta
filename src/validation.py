@@ -65,9 +65,16 @@ def validate_one_epoch(
         A tuple ``(avg_loss, mean_fg_dice, mean_fg_dice_all_cases_present,
         per_class_dice, component_losses)`` where ``component_losses`` maps
         each DiceCELoss sub-term name (``ce``, ``dice``, ``tversky``,
-        ``cldice``) to its mean patch-level loss over the sliding window.
+        ``cldice``, ``skelrecall``, ``cbdice``, ``cas``) to its mean
+        patch-level loss over the sliding window.
         Components not available (e.g. if the criterion does not expose
         ``forward_components``) are omitted.
+
+    Note:
+        Skeleton-based loss terms (``skelrecall``, ``cbdice``) will always
+        report zero during validation because precomputed target skeletons
+        are not loaded here. The primary validation signal comes from
+        per-class Dice and the non-skeleton loss terms.
     """
     model.eval()
     running_loss = 0.0
