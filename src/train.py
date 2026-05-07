@@ -256,8 +256,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tversky-weight",
         type=float,
-        default=0.0,
-        help="Weight for Tversky/Focal-Tversky term inside DiceCELoss (0 disables).",
+        default=1.0,
+        help="Weight for Tversky/Focal-Tversky term inside DiceCELoss.",
     )
     parser.add_argument(
         "--tversky-alpha",
@@ -280,7 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cldice-weight",
         type=float,
-        default=0.0,
+        default=1.0,
         help="Weight for clDice term inside DiceCELoss (0 disables clDice).",
     )
     parser.add_argument(
