@@ -1,6 +1,6 @@
 ---
 title: "3D Brain Vessel Segmentation from CTA"
-author: "Author"
+author: "Mahsa Abadian, Mame Gueye, Arihant Singh"
 date: "`r Sys.Date()`"
 output:
   pdf_document:
