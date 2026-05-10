@@ -152,6 +152,35 @@ After running `src/preprocess_resample.py`, the next step is to inspect the save
 - CT normalization is not done on the fly in the dataloader.
 - The loader expects CT images in `training_data_resampled/` to already be normalized by `src/preprocess_resample.py`.
 
+### Augmentation policy: no left/right flip
+- All resampled volumes are stored in **LPS** orientation, so array axis 0 is the
+  left/right axis (`nib.aff2axcodes(...)` returns `('L', 'P', 'S')` for every
+  case).
+- The training-time augmentation in `CTAPatchDataset.__getitem__` (and the
+  helper `random_flip_3d`) only flips axes 1 (A/P) and 2 (I/S). Axis 0 is
+  intentionally skipped.
+- **Why**: the labelmap distinguishes paired vessels by side (`R-ICA` vs
+  `L-ICA`, `R-M1` vs `L-M1`, `R-A1A2` vs `L-A1A2`, ..., `R-BVR` vs `L-BVR`).
+  A naive L/R flip swaps the visual side of every voxel **without** swapping
+  the paired class IDs, which trains the model to predict the right-sided
+  class on the left side and vice versa for ~50% of patches. The result is
+  catastrophic R/L confusion on every bilateral structure.
+- **Diagnostic signature** (from the `thin_vessel_phase3_arch` run): purely
+  midline classes (BA, SSS, ICVs, StS, VoG) had smooth monotone learning
+  curves that plateaued at 0.5–0.85 Dice, while every bilateral pair (R/L
+  ICA, R/L M1, R/L P1P2, ...) oscillated wildly between ~0.10 and ~0.65
+  every other epoch, settling around 0.37–0.41 only after the cosine LR
+  schedule decayed enough to damp the oscillation. The contrast made the
+  augmentation the unambiguous root cause.
+- **After the fix** (`thin_vessel_phase4_lrfix` run, identical
+  hyperparameters): bilateral classes converge smoothly to ~0.65–0.70 Dice,
+  `val_mean_fg_dice` lifts from ~0.30 to ~0.50, and
+  `val_mean_fg_dice_all_cases_present` from ~0.40 to ~0.65.
+- **Follow-up option**: re-enable axis-0 flip with a paired-class label
+  swap (R↔L LUT over the ~16 paired class pairs, nnUNet-style). This
+  recovers the lost augmentation diversity and effectively doubles
+  per-pair training data. Tracked in `PROJECT_TODO.md`.
+
 ---
 
 ## 5) Model

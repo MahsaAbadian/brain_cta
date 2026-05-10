@@ -29,6 +29,22 @@ This file tracks what is already done, what is currently underway, and what stil
 - Added per-class Dice logging to console and `metrics.csv`.
 - Added present-only foreground Dice tracking in validation (plus `val_mean_fg_dice_all` diagnostic metric).
 - Added challenge-like local evaluation script `src/evaluate_challenge_like.py` for full-volume inference.
+- Fixed L/R augmentation bug in `src/data_loader.py`: `CTAPatchDataset.__getitem__`
+  and the helper `random_flip_3d` previously flipped axes `(0, 1, 2)` with
+  `p=0.5`. Resampled volumes are LPS, so axis 0 is left/right; flipping it
+  without swapping paired class labels (`R-ICA <-> L-ICA`, `R-M1 <-> L-M1`,
+  ..., `R-BVR <-> L-BVR`) trained the head to predict right-sided classes
+  on the left side and vice versa for ~50% of patches. Diagnosis: in
+  `thin_vessel_phase3_arch`, every bilateral pair oscillated 0.10–0.65
+  Dice every other epoch and settled at ~0.37–0.41, while purely-midline
+  classes (BA, SSS, ICVs, StS, VoG) had clean monotone curves to 0.5–0.85
+  — an unambiguous signature. Restricting flips to axes 1 and 2 in
+  `thin_vessel_phase4_lrfix` (same hyperparameters) was sufficient to lift
+  `val_mean_fg_dice` from ~0.30 to ~0.50,
+  `val_mean_fg_dice_all_cases_present` from ~0.40 to ~0.65, and converge
+  the bilateral-pair curves smoothly to their previous training-time peaks
+  (~0.65–0.70 Dice). Documented under "Augmentation policy: no left/right
+  flip" in `DOCUMENTATION.md` §4 and "Data Augmentation" in `TRAINING.md`.
 
 ## In Progress
 
@@ -176,6 +192,12 @@ below are ordered roughly from easiest to hardest to implement.
 
 ### J) Data augmentation for thin vessels
 
+- **Paired L/R flip with label swap (nnUNet-style)**: re-enable axis-0
+  flipping by pairing it with a `R-* <-> L-*` class-label LUT (~16 pairs in
+  the TopBrain CT track). Currently disabled because a naive flip without
+  the swap caused R/L confusion (see "Done" entry); a paired flip recovers
+  the lost augmentation diversity and effectively doubles per-pair training
+  data.
 - **Elastic deformation**: random smooth spatial warping teaches the model that vessel shape
   varies across patients, reducing overfitting to specific vessel trajectories in the training set.
 - **Intensity jitter and gamma augmentation**: thin vessels are visible due to contrast

@@ -125,6 +125,51 @@ Model output logits:
 
 - `(N, num_classes, D, H, W)`
 
+## Data Augmentation
+
+`CTAPatchDataset.__getitem__` applies one form of training-time augmentation:
+random per-axis 50% flips, applied jointly to image, label, and (when used)
+the precomputed clDice target skeleton. Validation has no augmentation.
+
+### Flips are restricted to A/P (axis 1) and I/S (axis 2)
+
+The L/R axis (array axis 0 in the resampled LPS volumes) is **deliberately
+excluded** from random flipping. Confirm orientation with:
+
+```python
+import nibabel as nib
+print(nib.aff2axcodes(nib.load(
+    "training_data_resampled/imagesTr_topbrain_ct/<case>_0000.nii.gz"
+).affine))   # ('L', 'P', 'S')
+```
+
+Why we exclude axis 0:
+
+- The TopBrain labelmap distinguishes paired vessels by side: 16+ pairs of
+  `R-*` / `L-*` classes (`R-ICA` vs `L-ICA`, `R-M1` vs `L-M1`, `R-A1A2` vs
+  `L-A1A2`, ..., `R-BVR` vs `L-BVR`).
+- A naive L/R flip swaps the visual side of every voxel **without** swapping
+  the paired class IDs, so half of all training patches teach the model that
+  `R-*` voxels live on the patient's left and `L-*` voxels on the right.
+- The result was catastrophic R/L confusion on every bilateral structure.
+  Empirically: in `thin_vessel_phase3_arch` (350 epochs, naive flip), all
+  bilateral classes oscillated between ~0.10 and ~0.65 Dice every other
+  epoch and settled around 0.37–0.41; midline-only classes (`BA`, `SSS`,
+  `ICVs`, `StS`, `VoG`) had clean monotone curves to 0.5–0.85.
+- Removing the axis-0 flip in `thin_vessel_phase4_lrfix` (same
+  hyperparameters) was sufficient on its own to lift `val_mean_fg_dice`
+  from ~0.30 to ~0.50 and `val_mean_fg_dice_all_cases_present` from ~0.40
+  to ~0.65, with the bilateral pair curves becoming smooth and converging
+  to their previous training-time peaks (~0.65–0.70 Dice).
+
+### Future: paired flip (with label swap)
+
+The cleanest way to restore the lost augmentation diversity is to re-enable
+axis-0 flipping but pair it with an `R-* <-> L-*` label-swap LUT (the
+nnUNet approach). This is tracked in `PROJECT_TODO.md` as a follow-up; it
+also effectively doubles per-pair training data without harming
+discrimination.
+
 ## Loss Approaches and Exact Calculations
 
 Loss class: `DiceCELoss` in `src/train.py`.
