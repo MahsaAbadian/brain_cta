@@ -162,6 +162,8 @@ cython_debug/
 # OS / editor
 .DS_Store
 .vscode/
+.vs/
+.Rlibs/
 .envrc
 
 # Project data and generated outputs
